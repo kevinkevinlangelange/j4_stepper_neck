@@ -60,6 +60,25 @@ The parser uses a fixed char buffer (no Arduino `String`, so no heap fragmentati
 
 Strapping pins (0, 2, 12, 15) are avoided for outputs and the flash pins (6-11) are left alone. On WROVER modules GPIO 16/17 are tied to PSRAM, so this build targets a plain WROOM ESP32-DEV where they are free.
 
+## Pin diagram
+
+```
+                      ESP32-DEV (WROOM)  -  j4_stepper
+                  +--------------------------------------+
+   TTGO UART1 TX ->| 35 (UART1 RX, 250000)               |
+                  |                                      |
+   TMC5160T SPI:  | 18 SCK   19 MISO   23 MOSI  (shared) |
+     CS L/R/P  <--| 5        17        16               |
+   neck L STEP/DIR| 26 / 25                              |
+   neck R STEP/DIR| 33 / 32          ---> 3x TMC5160T (neck L/R/pivot)
+   neck P STEP/DIR| 27 / 14                              |
+                  |                                      |
+   eye STEP/DIR <-| 13 / 4           ---> 2x TMC2209 (eye-pop, ganged)
+   TMC2209 UART  <| 21 TX   22 RX    (PDN_UART bus)      |
+                  |        3V3   GND   VIN   VM(12-24V)  |
+                  +--------------------------------------+
+```
+
 ## Eye-pop wiring (two drivers, one step/dir pair)
 
 The two eye-pop motors always move at the same speed and direction, so both TMC2209 STEP inputs connect to GPIO 13 and both DIR inputs connect to GPIO 4. The ESP32 pin drives both high-impedance driver inputs with no trouble. This is the same idea as a dual-Z setup on a 3D printer, and it means the pair uses a single FastAccelStepper channel.
@@ -81,3 +100,20 @@ Eye-pop settings (`EYE_CURRENT`, `EYE_SPEED_HZ`, `EYE_ACCEL`, `EYE_TRAVEL`) are 
 ## Link to j4_receiver
 
 j4_receiver sends the packet on its UART1 TX at 250000 baud. Both boards are 3.3V, so no level shifter is needed. Only one wire plus ground is required (TTGO TX to this board's GPIO 35). `LINK_BAUD` here must match `STEPPER_LINK_BAUD` in j4_receiver.
+
+## Building and uploading
+
+```bash
+# Build
+pio run
+
+# Upload
+pio run --target upload
+
+# Monitor serial output
+pio device monitor
+```
+
+## Related projects
+
+- **[j4_receiver](https://github.com/kevinkevinlangelange/j4_receiver)** -- the TTGO receiver board that streams `nL,nR,nP,eye` packets to this board over UART1
