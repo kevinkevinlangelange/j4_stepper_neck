@@ -37,7 +37,7 @@ nL,nR,nP,eye\n
 | nL | neck left joystick value | 0-3200 |
 | nR | neck right joystick value | 0-3200 |
 | nP | neck pivot joystick value | 0-3200 |
-| eye | eye-pop value | 0-255 |
+| eye | eye-pop value | 0-3200 |
 
 The parser uses a fixed char buffer (no Arduino `String`, so no heap fragmentation). Any line that does not parse to exactly four integers is ignored, so a half-received line at power-up cannot move a motor.
 
@@ -95,7 +95,7 @@ VIO on every driver goes to 3.3V, VM to the 12-24V motor supply, and all grounds
 
 Neck values match the originals: 16 microsteps, 3200 steps/rev, `setSpeedInHz(3200)`, `setAcceleration(16000)`, `rms_current(2100)`. The neck-left axis is mapped inverted (`(3200 - nL) / 2`) exactly as j4_receiver had it.
 
-Eye-pop settings (`EYE_CURRENT`, `EYE_SPEED_HZ`, `EYE_ACCEL`, `EYE_TRAVEL`) are placeholders meant to be tuned to the eye-pop mechanism. `EYE_TRAVEL` sets how many microsteps the 0-255 eye value maps across.
+Eye-pop is bound to the neck settings so it moves with the same smooth ramp: `EYE_SPEED_HZ`, `EYE_ACCEL`, `EYE_MICROSTEPS`, and `EYE_THRESHOLD` are defined as the matching `NECK_*` values, and the eye value (0-3200, same scale as the neck) maps through `eye / 2` exactly like a neck axis. Only `EYE_CURRENT` stays separate, since it sets the TMC2209 driver current for the small eye-pop motors (not a motion setting) and the neck's 2.1A would be far too much. Tune `EYE_CURRENT` to your motors.
 
 ## Link to j4_receiver
 

@@ -2,6 +2,7 @@
 //         file name:  j4_stepper.ino
 //      v0_1 created:  2026-06-14 -- 0123 CDT -KL
 //      last updated:  2026-06-14 -- 0123 CDT -KL
+//      last updated:  2026-06-15 -- CDT
 //            author:  Kevin Lange
 //       description:  Dedicated stepper driver board for Johnny 4, running on
 //                     an ESP32-DEV (WROOM) module. Listens for ASCII position
@@ -18,6 +19,11 @@
 //                     Library and motion settings are copied from j4_receiver /
 //                     j4_motor_test_dev so the neck moves exactly as before.
 //       update log:  v0_1 -- Initial build. Fixed-buffer ASCII parser, 5 motors.
+//                    v0_2 -- Eye-pop now arrives on the 0-3200 scale and is bound
+//                            to the neck motion settings (same speed, accel,
+//                            microsteps, threshold, and /2 mapping) so it moves
+//                            with the same smooth ramp as the neck. Driver current
+//                            stays separate (small eye motors, not the neck's 2.1A).
 //
 //
 //
@@ -28,7 +34,7 @@
 //     nL  -- neck left   joystick value   (0-3200)
 //     nR  -- neck right  joystick value   (0-3200)
 //     nP  -- neck pivot  joystick value   (0-3200)
-//     eye -- eye-pop     value            (0-255)
+//     eye -- eye-pop     value            (0-3200, same scale as the neck)
 //   Any line that does not parse to exactly four ints is ignored, so a
 //   half-received line on power-up cannot move a motor.
 //  ------------------------------------------------------------------
@@ -124,13 +130,16 @@
 #define NECK_THRESHOLD      20    // min joystick-unit change (0-3200) to re-issue moveTo
 
 // Eye-pop -- TMC2209 (current/microstep settable over UART)
-#define R_SENSE_2209      0.11f   // typical BTT/FYSETC TMC2209 sense resistor -- verify on your board
-#define EYE_CURRENT        800    // RMS mA -- placeholder, tune to your eye-pop motors
-#define EYE_MICROSTEPS      16
-#define EYE_SPEED_HZ      3200    // tune for the eye-pop "feel"
-#define EYE_ACCEL        16000
-#define EYE_TRAVEL        1600    // microsteps of travel mapped from eye value 0..255
-#define EYE_THRESHOLD        2    // min eye-unit change (0-255) to re-issue moveTo
+// Eye-pop motion is bound to the neck settings so it moves with the same smooth
+// ramp as the neck axes. Only the driver current (a TMC setting, not a motion
+// setting) stays separate -- the neck's 2.1A would be far too much for small
+// eye-pop motors.
+#define R_SENSE_2209      0.11f         // typical BTT/FYSETC TMC2209 sense resistor -- verify on your board
+#define EYE_CURRENT        800          // RMS mA -- tune to your eye-pop motors (driver current, not motion)
+#define EYE_MICROSTEPS    NECK_MICROSTEPS
+#define EYE_SPEED_HZ      NECK_SPEED_HZ // same speed as the neck
+#define EYE_ACCEL         NECK_ACCEL    // same acceleration as the neck
+#define EYE_THRESHOLD     NECK_THRESHOLD // same change threshold (0-3200 scale)
 
 // Defaults at boot (centre the neck, eyes retracted)
 #define NECK_CENTER       1600    // joystick midpoint (0-3200)
@@ -176,9 +185,11 @@ uint8_t rxLen = 0;
 
 
 // Map the same way j4_receiver used to: neck travel is half a joystick range.
+// Eye-pop now arrives on the same 0-3200 scale and uses the same mapping as the
+// neck, so it travels and ramps identically.
 static inline int32_t neckTarget(int joy)      { return (int32_t)joy / 2; }
 static inline int32_t neckTargetInv(int joy)   { return (int32_t)(3200 - joy) / 2; }
-static inline int32_t eyeTarget(int eye)       { return (int32_t)map(eye, 0, 255, 0, EYE_TRAVEL); }
+static inline int32_t eyeTarget(int eye)       { return (int32_t)eye / 2; }
 
 
 // Apply one parsed packet to the motors, with the per-axis change threshold so
