@@ -36,6 +36,9 @@
 //                            a safety stop if a limit trips mid-move. Limit state is
 //                            reported in the status string. SG thresholds and homing
 //                            params still need hardware tuning.
+//                    v0_5 -- Also report the eyes-board link state upstream as an
+//                            "EY:<0/1>" line, so j4_receiver / j4_controller can show
+//                            j4_stepper_eyes connection on the status screen.
 //
 //
 //
@@ -472,11 +475,13 @@ void loop() {
     pollNeckFaults();
   }
 
-  // Report merged status upstream.
+  // Report merged status + the eyes-board link state upstream.
   if (now - lastStatusTx >= STATUS_TX_MS) {
     lastStatusTx = now;
     char status[24];
     buildStatus(status, sizeof(status));
     upSerial.printf("ST:%s\n", status);
+    bool eyesLinkOk = eyesSeen && (now - eyesLastSeen <= EYES_TIMEOUT_MS);
+    upSerial.printf("EY:%d\n", eyesLinkOk ? 1 : 0);
   }
 }
