@@ -42,13 +42,15 @@ Motion settings are copied from j4_motor_test_dev so the neck moves exactly as b
 | Direction | Message | Meaning |
 |-----------|---------|---------|
 | in | `nL,nR,nP,eye\n` | neck L/R/pivot + eye-pop, all 0-3200 |
-| out | `ST:<text>\n` | merged status, e.g. `ST:OK`, `ST:NL OT`, `ST:EYES OFFLINE` |
+| in | `CAL\n` | run a homing/calibration pass (also forwarded to the eyes board) |
+| out | `ST:<text>\n` | merged status, e.g. `ST:OK`, `ST:NL OT`, `ST:NL LIMIT`, `ST:EYES OFFLINE` |
 
 **Downstream (UART2, to/from j4_stepper_eyes):**
 
 | Direction | Message | Meaning |
 |-----------|---------|---------|
 | out | `<eye>\n` | the forwarded eye-pop value (0-3200) |
+| out | `CAL\n` | tell the eyes board to calibrate too |
 | in | `S:<text>\n` | the eyes board's status (`S:OK`, `S:EL OT`, ...) |
 
 The parsers use fixed char buffers (no Arduino `String`, so no heap fragmentation). A line that does not parse is ignored.
@@ -58,11 +60,20 @@ The parsers use fixed char buffers (no Arduino `String`, so no heap fragmentatio
 Every 200 ms the board sends one status string upstream, chosen by priority:
 
 1. `EYES OFFLINE` -- no status from the eyes board within 800 ms
-2. a neck driver fault -- `NL`/`NR`/`NP` + `OT` (overtemp shutdown), `SHORT`, `OTPW` (overtemp prewarning), or `OPEN` (open load)
+2. a neck driver fault -- `NL`/`NR`/`NP` + `OT` (overtemp shutdown), `SHORT`, `OTPW` (overtemp prewarning), `OPEN` (open load), or `LIMIT` (a limit switch is engaged or its wire is broken)
 3. an eye driver fault relayed up from the eyes board (`EL`/`ER` + token)
 4. `OK`
 
 The DRV_STATUS registers are polled every 100 ms over the existing SPI bus. Reads do not disturb motion, since step pulses come from the RMT peripheral, not the CPU.
+
+## Limit switches and calibration
+
+Each axis has **two normally-closed (NC) switches wired in series** to one input (GPIO 34/35/36), with an **external 10k pull-up to 3.3V**. Both closed (in range) reads LOW; either switch opening, or a broken wire, reads HIGH and is treated as a limit hit (fail-safe). The travel direction tells which end was reached.
+
+- **In normal operation**, if a limit trips while an axis is moving, that axis is stopped immediately.
+- **On a `CAL` command**, the board homes each axis: it drives slowly toward the home end until the limit switch trips **or** StallGuard detects a hard stop, backs off, and zeros the position. StallGuard (read over SPI, no extra pins) is what catches an axis that is **already sitting against a stop** when calibration starts -- it stalls the instant it tries to push further, instead of grinding.
+
+The StallGuard threshold (`SG_SGT`, `SG_STALL_LEVEL`), homing speed/back-off, and the home direction are `#define`s at the top of `main.cpp` and **need tuning on the real mechanism**. The far-end range is then enforced in software once homed.
 
 ## Pin assignments
 
@@ -79,6 +90,9 @@ The DRV_STATUS registers are polled every 100 ms over the existing SPI bus. Read
 | 27 / 14 | neck-pivot STEP / DIR |
 | 4 / 13 | Upstream UART1 RX / TX (to TTGO) |
 | 21 / 22 | Downstream UART2 TX / RX (to eyes board) |
+| 34 | neck-left limit switches (input, external pull-up) |
+| 35 | neck-right limit switches (input, external pull-up) |
+| 36 | neck-pivot limit switches (input, external pull-up) |
 
 All links use plain bidirectional GPIOs; strapping pins (0/2/12/15), flash pins (6-11), and the input-only pins (34-39) are avoided so the firmware runs on any of these WROOM boards (some route battery sense to GPIO35 or an LED to GPIO2).
 
@@ -95,8 +109,11 @@ All links use plain bidirectional GPIOs; strapping pins (0/2/12/15), flash pins 
    neck L STEP/DIR| 26 / 25                              |
    neck R STEP/DIR| 33 / 32          ---> 3x TMC5160T (neck L/R/pivot)
    neck P STEP/DIR| 27 / 14                              |
+   limit inputs <-| 34 (NL)  35 (NR)  36 (NP)            |
                   |        3V3   GND   VIN   VM(12-24V)  |
                   +--------------------------------------+
+
+   Each limit input = two NC switches in series + a 10k pull-up to 3.3V.
 ```
 
 ## Power and enable

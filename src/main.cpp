@@ -29,6 +29,13 @@
 //                            2-way upstream link, a downstream link to the eyes
 //                            board (relays the eye value), DRV_STATUS fault polling
 //                            on the three neck drivers, and a merged status report.
+//                    v0_4 -- Added limit switches (two NC per axis in series, one
+//                            input each: GPIO 34/35/36), StallGuard2 config + stall
+//                            detection, a CAL homing routine that stops on a limit
+//                            OR a stall (so an axis already at a stop is caught), and
+//                            a safety stop if a limit trips mid-move. Limit state is
+//                            reported in the status string. SG thresholds and homing
+//                            params still need hardware tuning.
 //
 //
 //
@@ -38,10 +45,11 @@
 //   "nL,nR,nP,eye\n"   four comma-separated integers, newline terminated
 //     nL  -- neck left   (0-3200)     nR  -- neck right (0-3200)
 //     nP  -- neck pivot  (0-3200)     eye -- eye-pop    (0-3200), forwarded down
-//   A line that does not parse to four ints is ignored.
+//   "CAL\n"            run a homing/calibration pass (also forwarded downstream)
+//   A line that does not parse is ignored.
 //
 //  UPSTREAM STATUS (to j4_receiver, UART1)
-//   "ST:<text>\n"   e.g. "ST:OK", "ST:NL OT", "ST:EYES OFFLINE"
+//   "ST:<text>\n"   e.g. "ST:OK", "ST:NL OT", "ST:NL LIMIT", "ST:EYES OFFLINE"
 //
 //  DOWNSTREAM (to j4_stepper_eyes, UART2)
 //   out: "<eye>\n"          the forwarded eye-pop value (0-3200)
@@ -71,6 +79,14 @@
 //  Downstream link to j4_stepper_eyes, UART2, 2-way:
 //   21:  UART2 TX  --> eyes GPIO4 (RX)
 //   22:  UART2 RX  <-- eyes GPIO13 (TX)
+//
+//  Limit switches (two NC switches per axis in SERIES -> one input each, with an
+//  external 10k pull-up to 3.3V; LOW = in range, HIGH = limit hit / broken wire):
+//   34:  neck-left  limits      35:  neck-right limits      36:  neck-pivot limits
+//
+//  StallGuard: read over SPI (no extra pins). During calibration each axis homes
+//  to a limit switch OR a StallGuard stall (so an axis already against a stop is
+//  caught at once). Thresholds in the code need tuning on the real mechanism.
 //
 //  Power / enable:
 //   3.3V -> all driver VIO       GND -> all driver GND (common with ESP32)
@@ -133,6 +149,35 @@
 #define NECK_ACCEL       16000    // microsteps/sec^2
 #define NECK_THRESHOLD      20    // min joystick-unit change (0-3200) to re-issue moveTo
 #define NECK_CENTER       1600    // joystick midpoint (0-3200)
+
+
+// ---------------------------------------------------------------------------
+// LIMIT SWITCHES + STALLGUARD
+// ---------------------------------------------------------------------------
+// Two normally-closed switches per axis wired IN SERIES to one input, with an
+// external 10k pull-up to 3.3V. LOW = both closed (in range); HIGH = a limit was
+// hit OR a wire broke (fail-safe). The travel direction tells which end. These
+// are input-only pins, so they need the external pull-up (no internal one).
+#define LIMIT_PIN_NL  34
+#define LIMIT_PIN_NR  35
+#define LIMIT_PIN_NP  36
+static inline bool limitHit(uint8_t pin) { return digitalRead(pin) == HIGH; }
+
+// StallGuard2 (read over SPI). sg_result() drops toward 0 under load; near 0 is a
+// stall. Used during calibration so an axis already jammed against a stop is
+// caught the moment it tries to move. THESE VALUES NEED HARDWARE TUNING.
+#define SG_SGT             8       // StallGuard2 threshold (-64..63); higher = less sensitive
+#define SG_TCOOLTHRS  0xFFFFF      // enable StallGuard above near-standstill speed
+#define SG_STALL_LEVEL    40       // sg_result below this counts as a stall (tune)
+
+// StallGuard stall check (valid while moving; do not rely on it at standstill).
+static inline bool stalled5160(TMC5160Stepper &drv) { return drv.sg_result() < SG_STALL_LEVEL; }
+
+// Homing/calibration tunables (per-hardware -- adjust on the bench).
+#define HOMING_SPEED_HZ   800      // slow approach speed
+#define HOMING_ACCEL     8000
+#define HOMING_BACKOFF    200      // microsteps to back off after touching a limit
+#define HOMING_TIMEOUT_MS 9000     // safety cap per axis
 
 
 // ---------------------------------------------------------------------------
@@ -199,8 +244,11 @@ void applyNeck(int nL, int nR, int nP) {
 }
 
 
-// Parse "nL,nR,nP,eye": drive the neck and forward the eye value downstream.
+bool calRequested = false;
+
+// Parse "nL,nR,nP,eye" (drive neck + forward eye) or "CAL" (request calibration).
 void parseUpstream(const char *line) {
+  if (strcmp(line, "CAL") == 0) { calRequested = true; return; }
   int nL, nR, nP, eye;
   if (sscanf(line, "%d,%d,%d,%d", &nL, &nR, &nP, &eye) == 4) {
     applyNeck(nL, nR, nP);
@@ -237,6 +285,67 @@ void pollNeckFaults() {
   if ((t = faultToken5160(tmc_NL))[0]) { snprintf(neckFault, sizeof(neckFault), "NL %s", t); return; }
   if ((t = faultToken5160(tmc_NR))[0]) { snprintf(neckFault, sizeof(neckFault), "NR %s", t); return; }
   if ((t = faultToken5160(tmc_NP))[0]) { snprintf(neckFault, sizeof(neckFault), "NP %s", t); return; }
+  // A limit input reads HIGH when a switch is hit or its wire is broken.
+  if (limitHit(LIMIT_PIN_NL)) { strncpy(neckFault, "NL LIMIT", sizeof(neckFault) - 1); return; }
+  if (limitHit(LIMIT_PIN_NR)) { strncpy(neckFault, "NR LIMIT", sizeof(neckFault) - 1); return; }
+  if (limitHit(LIMIT_PIN_NP)) { strncpy(neckFault, "NP LIMIT", sizeof(neckFault) - 1); return; }
+}
+
+
+// Safety: if an axis is moving and its limit trips, stop it immediately.
+void checkLimits() {
+  if (stepper_NL && stepper_NL->isRunning() && limitHit(LIMIT_PIN_NL)) stepper_NL->forceStop();
+  if (stepper_NR && stepper_NR->isRunning() && limitHit(LIMIT_PIN_NR)) stepper_NR->forceStop();
+  if (stepper_NP && stepper_NP->isRunning() && limitHit(LIMIT_PIN_NP)) stepper_NP->forceStop();
+}
+
+
+// Home one axis: drive toward the home (negative) end until the limit switch trips
+// or StallGuard detects a hard stop (this catches an axis already against a stop),
+// then back off until the limit clears and zero the position. NEEDS HARDWARE
+// VALIDATION -- the direction, speed, backoff, and SG level are all tunable above.
+void homeAxis(FastAccelStepper *s, uint8_t limitPin, TMC5160Stepper &drv) {
+  if (!s) return;
+  s->setSpeedInHz(HOMING_SPEED_HZ);
+  s->setAcceleration(HOMING_ACCEL);
+
+  // Approach the home (negative) end. With one shared series input we can't tell
+  // the two ends apart, so only trust the limit switch once we've seen it read
+  // clear (LOW) at least once -- that way starting against the FAR limit just
+  // drives us off it and onward to home. StallGuard stops a real jam immediately
+  // (this is what catches an axis already pinned against the HOME stop at start).
+  s->move(-1000000);
+  bool seenClear = !limitHit(limitPin);
+  unsigned long t0 = millis();
+  while (s->isRunning()) {
+    if (!limitHit(limitPin))                  seenClear = true;
+    if (stalled5160(drv))                     { s->forceStop(); break; }
+    if (seenClear && limitHit(limitPin))      { s->forceStop(); break; }
+    if (millis() - t0 > HOMING_TIMEOUT_MS)    { s->forceStop(); break; }
+    delay(1);
+  }
+  delay(50);
+
+  // Back off until the limit clears, then zero here.
+  s->setCurrentPosition(0);
+  s->move(HOMING_BACKOFF);
+  t0 = millis();
+  while (s->isRunning() && (millis() - t0 < HOMING_TIMEOUT_MS)) delay(1);
+  s->setCurrentPosition(0);
+
+  // Restore normal motion settings.
+  s->setSpeedInHz(NECK_SPEED_HZ);
+  s->setAcceleration(NECK_ACCEL);
+}
+
+
+// Calibrate all neck axes, then ask the eyes board to calibrate too.
+void calibrate() {
+  dnSerial.println("CAL");           // tell the eyes board to home as well
+  homeAxis(stepper_NL, LIMIT_PIN_NL, tmc_NL);
+  homeAxis(stepper_NR, LIMIT_PIN_NR, tmc_NR);
+  homeAxis(stepper_NP, LIMIT_PIN_NP, tmc_NP);
+  last_nL = last_nR = last_nP = NECK_CENTER;   // force a fresh move on next packet
 }
 
 
@@ -265,6 +374,10 @@ void configTmc5160(TMC5160Stepper &drv) {
   drv.microsteps(NECK_MICROSTEPS);
   drv.en_pwm_mode(true); // StealthChop
   drv.pwm_autoscale(true);
+  // StallGuard2 (used during calibration; needs tuning on real hardware)
+  drv.TCOOLTHRS(SG_TCOOLTHRS);
+  drv.sgt(SG_SGT);
+  drv.sfilt(true);
 }
 
 
@@ -288,6 +401,11 @@ void setup() {
   // --- Links ---
   upSerial.begin(LINK_BAUD, SERIAL_8N1, UP_RX_PIN, UP_TX_PIN);   // to TTGO
   dnSerial.begin(LINK_BAUD, SERIAL_8N1, DN_RX_PIN, DN_TX_PIN);   // to eyes board
+
+  // --- Limit switches (series NC, external pull-up -> plain INPUT) ---
+  pinMode(LIMIT_PIN_NL, INPUT);
+  pinMode(LIMIT_PIN_NR, INPUT);
+  pinMode(LIMIT_PIN_NP, INPUT);
 
   // --- TMC5160T neck drivers over software SPI ---
   configTmc5160(tmc_NL);
@@ -336,6 +454,15 @@ void loop() {
       dnLen = 0;
     }
   }
+
+  // Run a calibration pass if one was requested (blocks while homing).
+  if (calRequested) {
+    calRequested = false;
+    calibrate();
+  }
+
+  // Safety: stop any axis whose limit trips mid-move.
+  checkLimits();
 
   unsigned long now = millis();
 
