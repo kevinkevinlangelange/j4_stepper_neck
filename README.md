@@ -1,45 +1,68 @@
-# j4_stepper
+# j4_stepper_neck
 
-Dedicated stepper driver board for the Johnny 4 robot. Runs on an ESP32-DEV (WROOM) module. It listens for position packets from the j4_receiver (TTGO) over a wired UART link and drives all five of Johnny 4's stepper motors. Pulse generation runs on the ESP32 RMT peripheral via FastAccelStepper, so the CPU never blocks and the board stays lightly loaded.
+Neck stepper driver board for the Johnny 4 robot, and the middle node of the stepper daisy chain. Runs on an ESP32-DEV (WROOM) module. It drives the three neck steppers via BIGTREETECH TMC5160T drivers, relays the eye-pop value down to [j4_stepper_eyes](https://github.com/kevinkevinlangelange/j4_stepper_eyes), and reports driver health back up to the receiver. Step pulses run on the ESP32 RMT peripheral via FastAccelStepper, so the CPU never blocks.
+
+## Daisy chain
+
+```
+  j4_controller --ESP-NOW--> j4_receiver (TTGO)
+                                  |  UART1 (2-way, 250000)
+                                  v
+                          j4_stepper_neck   (3x TMC5160T)   <-- this board
+                                  |  UART2 (2-way, 250000)
+                                  v
+                          j4_stepper_eyes   (2x TMC2209)
+```
+
+The TTGO only has one free hardware UART, so the boards are chained rather than each wired to the TTGO. This board is the relay in the middle: it takes the full packet from the receiver, keeps the neck fields, and passes the eye field downstream; status flows back the other way.
 
 ## What this board does
 
-- Receives ASCII position packets from j4_receiver over UART1 (one-way, wired)
+- Receives `nL,nR,nP,eye` from j4_receiver over UART1 (2-way)
 - Drives 3 neck steppers via BTT TMC5160T drivers (neck left, neck right, neck pivot)
-- Drives 2 eye-pop steppers via TMC2209 drivers, ganged so they always move together
+- Forwards the `eye` value to j4_stepper_eyes over UART2
+- Polls each TMC5160T's DRV_STATUS register for faults (overtemp prewarning/shutdown, short-to-ground, open-load)
+- Merges its own driver status with the eyes board's status and a link-alive check, and reports a single status string back upstream
 - Filters out tiny commanded changes (per-axis threshold) so the motors do not jitter at rest
 
-The stepper library and motion settings are copied from j4_receiver and j4_motor_test_dev so the neck moves exactly as it did before the steppers were relocated to this board.
-
-## Why a separate board
-
-The TTGO receiver already runs the TFT, ESP-NOW, and two UART links. Moving the steppers onto their own ESP32 keeps each board lightly loaded and frees the TTGO's GPIO. Because FastAccelStepper offloads every step pulse to the RMT hardware, the ESP32-DEV has plenty of headroom for five motors.
+Motion settings are copied from j4_motor_test_dev so the neck moves exactly as before.
 
 ## Hardware
 
 | Component | Details |
 |-----------|---------|
-| Microcontroller | ESP32-DEV (WROOM) |
+| Microcontroller | ESP32-DEV (WROOM-32) |
 | Neck drivers | 3x BIGTREETECH TMC5160T V1.0 (software SPI) |
-| Eye-pop drivers | 2x TMC2209 (shared single-wire UART) |
 | Neck motors | STEPPERONLINE 17HE24-2104S (2.1A) |
 
-## Incoming packet format
+## Link protocol
 
-One newline-terminated line of four comma-separated integers:
+**Upstream (UART1, to/from j4_receiver):**
 
-```
-nL,nR,nP,eye\n
-```
+| Direction | Message | Meaning |
+|-----------|---------|---------|
+| in | `nL,nR,nP,eye\n` | neck L/R/pivot + eye-pop, all 0-3200 |
+| out | `ST:<text>\n` | merged status, e.g. `ST:OK`, `ST:NL OT`, `ST:EYES OFFLINE` |
 
-| Field | Meaning | Range |
-|-------|---------|-------|
-| nL | neck left joystick value | 0-3200 |
-| nR | neck right joystick value | 0-3200 |
-| nP | neck pivot joystick value | 0-3200 |
-| eye | eye-pop value | 0-3200 |
+**Downstream (UART2, to/from j4_stepper_eyes):**
 
-The parser uses a fixed char buffer (no Arduino `String`, so no heap fragmentation). Any line that does not parse to exactly four integers is ignored, so a half-received line at power-up cannot move a motor.
+| Direction | Message | Meaning |
+|-----------|---------|---------|
+| out | `<eye>\n` | the forwarded eye-pop value (0-3200) |
+| in | `S:<text>\n` | the eyes board's status (`S:OK`, `S:EL OT`, ...) |
+
+The parsers use fixed char buffers (no Arduino `String`, so no heap fragmentation). A line that does not parse is ignored.
+
+## Status reporting
+
+Every 200 ms the board sends one status string upstream, chosen by priority:
+
+1. `EYES OFFLINE` -- no status from the eyes board within 800 ms
+2. a neck driver fault -- `NL`/`NR`/`NP` + `OT` (overtemp shutdown), `SHORT`, `OTPW` (overtemp prewarning), or `OPEN` (open load)
+3. an eye driver fault relayed up from the eyes board (`EL`/`ER` + token)
+4. `OK`
+
+The DRV_STATUS registers are polled every 100 ms over the existing SPI bus. Reads do not disturb motion, since step pulses come from the RMT peripheral, not the CPU.
 
 ## Pin assignments
 
@@ -54,38 +77,27 @@ The parser uses a fixed char buffer (no Arduino `String`, so no heap fragmentati
 | 26 / 25 | neck-left STEP / DIR |
 | 33 / 32 | neck-right STEP / DIR |
 | 27 / 14 | neck-pivot STEP / DIR |
-| 13 / 4 | eye-pop STEP / DIR (both TMC2209, shared) |
-| 21 / 22 | TMC2209 UART TX / RX (PDN_UART bus) |
-| 35 | UART1 RX, from TTGO UART1 TX (input-only pin, fine for RX) |
+| 4 / 13 | Upstream UART1 RX / TX (to TTGO) |
+| 21 / 22 | Downstream UART2 TX / RX (to eyes board) |
 
-Strapping pins (0, 2, 12, 15) are avoided for outputs and the flash pins (6-11) are left alone. On WROVER modules GPIO 16/17 are tied to PSRAM, so this build targets a plain WROOM ESP32-DEV where they are free.
+All links use plain bidirectional GPIOs; strapping pins (0/2/12/15), flash pins (6-11), and the input-only pins (34-39) are avoided so the firmware runs on any of these WROOM boards (some route battery sense to GPIO35 or an LED to GPIO2).
 
 ## Pin diagram
 
 ```
-                      ESP32-DEV (WROOM)  -  j4_stepper
+                   ESP32-DEV (WROOM)  -  j4_stepper_neck
                   +--------------------------------------+
-   TTGO UART1 TX ->| 35 (UART1 RX, 250000)               |
+   TTGO 21 (TX) ->| 4  (UART1 RX)        21 (UART2 TX) |-> eyes 4 (RX)
+   TTGO 22 (RX) <-| 13 (UART1 TX)        22 (UART2 RX) |<- eyes 13 (TX)
                   |                                      |
    TMC5160T SPI:  | 18 SCK   19 MISO   23 MOSI  (shared) |
      CS L/R/P  <--| 5        17        16               |
    neck L STEP/DIR| 26 / 25                              |
    neck R STEP/DIR| 33 / 32          ---> 3x TMC5160T (neck L/R/pivot)
    neck P STEP/DIR| 27 / 14                              |
-                  |                                      |
-   eye STEP/DIR <-| 13 / 4           ---> 2x TMC2209 (eye-pop, ganged)
-   TMC2209 UART  <| 21 TX   22 RX    (PDN_UART bus)      |
                   |        3V3   GND   VIN   VM(12-24V)  |
                   +--------------------------------------+
 ```
-
-## Eye-pop wiring (two drivers, one step/dir pair)
-
-The two eye-pop motors always move at the same speed and direction, so both TMC2209 STEP inputs connect to GPIO 13 and both DIR inputs connect to GPIO 4. The ESP32 pin drives both high-impedance driver inputs with no trouble. This is the same idea as a dual-Z setup on a 3D printer, and it means the pair uses a single FastAccelStepper channel.
-
-The two drivers share one PDN_UART bus (GPIO 21/22, joined to each driver's PDN_UART pin through a 1k resistor). They are told apart by their MS1/MS2 address straps: driver 0 = 0b00, driver 1 = 0b01.
-
-If you would rather skip the UART, the TMC2209s also run in standalone mode (current set by the VREF pot, microstep by MS1/MS2). In that case GPIO 21/22 are unused and the UART config in `setup()` can be removed.
 
 ## Power and enable
 
@@ -93,13 +105,7 @@ VIO on every driver goes to 3.3V, VM to the 12-24V motor supply, and all grounds
 
 ## Motion settings
 
-Neck values match the originals: 16 microsteps, 3200 steps/rev, `setSpeedInHz(3200)`, `setAcceleration(16000)`, `rms_current(2100)`. The neck-left axis is mapped inverted (`(3200 - nL) / 2`) exactly as j4_receiver had it.
-
-Eye-pop is bound to the neck settings so it moves with the same smooth ramp: `EYE_SPEED_HZ`, `EYE_ACCEL`, `EYE_MICROSTEPS`, and `EYE_THRESHOLD` are defined as the matching `NECK_*` values, and the eye value (0-3200, same scale as the neck) maps through `eye / 2` exactly like a neck axis. Only `EYE_CURRENT` stays separate, since it sets the TMC2209 driver current for the small eye-pop motors (not a motion setting) and the neck's 2.1A would be far too much. Tune `EYE_CURRENT` to your motors.
-
-## Link to j4_receiver
-
-j4_receiver sends the packet on its UART1 TX at 250000 baud. Both boards are 3.3V, so no level shifter is needed. Only one wire plus ground is required (TTGO TX to this board's GPIO 35). `LINK_BAUD` here must match `STEPPER_LINK_BAUD` in j4_receiver.
+Neck values match the originals: 16 microsteps, `setSpeedInHz(3200)`, `setAcceleration(16000)`, `rms_current(2100)`. The neck-left axis is mapped inverted (`(3200 - nL) / 2`).
 
 ## Building and uploading
 
@@ -116,4 +122,5 @@ pio device monitor
 
 ## Related projects
 
-- **[j4_receiver](https://github.com/kevinkevinlangelange/j4_receiver)** -- the TTGO receiver board that streams `nL,nR,nP,eye` packets to this board over UART1
+- **[j4_receiver](https://github.com/kevinkevinlangelange/j4_receiver)** -- the TTGO that streams `nL,nR,nP,eye` to this board and relays its status to the controller
+- **[j4_stepper_eyes](https://github.com/kevinkevinlangelange/j4_stepper_eyes)** -- the eye-pop stepper board downstream of this one
