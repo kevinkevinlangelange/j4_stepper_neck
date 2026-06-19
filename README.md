@@ -94,7 +94,9 @@ The StallGuard threshold (`SG_SGT`, `SG_STALL_LEVEL`), homing speed/back-off, an
 | 35 | neck-right limit switches (input, external pull-up) |
 | 36 | neck-pivot limit switches (input, external pull-up) |
 
-All links use plain bidirectional GPIOs; strapping pins (0/2/12/15), flash pins (6-11), and the input-only pins (34-39) are avoided so the firmware runs on any of these WROOM boards (some route battery sense to GPIO35 or an LED to GPIO2).
+The links and step/dir use plain bidirectional GPIOs (strapping pins 0/2/12/15 and flash pins 6-11 are avoided). The three limit inputs use the input-only pins 34/35/36, each with an external 10k pull-up to 3.3V.
+
+Note: some of these LiPo dev boards route battery sense to GPIO35 (or an LED to GPIO2). Verify your board before wiring the neck-right limit to GPIO35; **GPIO39** is a free input-only pin to move it to if needed. Limit switches are not required for normal operation, so you can wire them later.
 
 ## Pin diagram
 
