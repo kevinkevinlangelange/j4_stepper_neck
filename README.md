@@ -88,33 +88,40 @@ The StallGuard threshold (`SG_SGT`, `SG_STALL_LEVEL`), homing speed/back-off, an
 | 26 / 25 | neck-left STEP / DIR |
 | 33 / 32 | neck-right STEP / DIR |
 | 27 / 14 | neck-pivot STEP / DIR |
-| 4 / 13 | Upstream UART1 RX / TX (to TTGO) |
-| 21 / 35 | Downstream UART2 TX / RX (to eyes board) |
+| 4 / 13 | Upstream UART1 RX / TX -- to j4_receiver: RX from TTGO GPIO 21, TX to TTGO GPIO 22 |
+| 22 / 35 | Downstream UART2 TX / RX -- to j4_stepper_eyes: TX to eyes GPIO 4, RX from eyes GPIO 13 |
 | 34 | neck-left limit switches (input, external pull-up) |
 | 36 | neck-right limit switches (input, external pull-up) |
 | 39 | neck-pivot limit switches (input, external pull-up) |
 
-The board is a bare ESP32-D0WD (LOLIN32-Lite style). It has **no battery-sense pin**, so the input-only GPIO 35 is used for the downstream RX. Its **onboard LED is on GPIO 22**, which is therefore left unused. The step/dir and the upstream/downstream TX use plain bidirectional GPIOs (strapping pins 0/2/12/15 and flash pins 6-11 avoided). The three limit inputs use the input-only pins 34/36/39, each with an external 10k pull-up to 3.3V.
+The board is a bare ESP32-D0WD (LOLIN32-Lite style). It does **not break out GPIO 21**, so the downstream UART TX is on **GPIO 22** (which also drives the onboard LED, giving a handy downstream-activity blink). The downstream RX is on the input-only **GPIO 35**; the board has **no battery-sense pin**, so 35 is safe to use. The step/dir lines use plain bidirectional GPIOs (strapping pins 0/2/12/15 and flash pins 6-11 avoided). The three limit inputs use the input-only pins 34/36/39, each with an external 10k pull-up to 3.3V.
 
 Limit switches are not required for normal operation, so you can wire them whenever you add them.
 
 ## Pin diagram
 
-```
-                   ESP32-DEV (WROOM)  -  j4_stepper_neck
-                  +--------------------------------------+
-   TTGO 21 (TX) ->| 4  (UART1 RX)        21 (UART2 TX) |-> eyes 4 (RX)
-   TTGO 22 (RX) <-| 13 (UART1 TX)        35 (UART2 RX) |<- eyes 13 (TX)
-                  |                                      |
-   TMC5160T SPI:  | 18 SCK   19 MISO   23 MOSI  (shared) |
-     CS L/R/P  <--| 5        17        16               |
-   neck L STEP/DIR| 26 / 25                              |
-   neck R STEP/DIR| 33 / 32          ---> 3x TMC5160T (neck L/R/pivot)
-   neck P STEP/DIR| 27 / 14                              |
-   limit inputs <-| 34 (NL)  36 (NR)  39 (NP)            |
-                  |        3V3   GND   VIN   VM(12-24V)  |
-                  +--------------------------------------+
+This matches the real pin order on the board: hold it component-side up with the
+USB-C connector at the bottom. The two header rails read top-to-bottom as shown.
 
+```
+          LEFT rail                                RIGHT rail
+                          +--------------+
+       limit NR -- 36 |   |              |   | 3V3   3.3V
+       limit NP -- 39 |   |              |   | 22    DN UART2 TX -> eyes 4   (LED)
+          reset -- EN |   |  ESP32-D0WD  |   | 19    SPI MISO
+       limit NL -- 34 |   |  (LOLIN32-   |   | 23    SPI MOSI
+ DN RX <-eyes13 -- 35 |   |   Lite style)|   | 18    SPI SCK
+     DIR neck-R -- 32 |   |              |   | 5     CS neck-L
+    STEP neck-R -- 33 |   |              |   | 17    CS neck-R
+     DIR neck-L -- 25 |   |              |   | 16    CS neck-P
+    STEP neck-L -- 26 |   |              |   | 4     UART1 RX <- TTGO 21
+    STEP neck-P -- 27 |   |              |   | 0     (free / BOOT)
+     DIR neck-P -- 14 |   |              |   | 2     (free)
+         (free) -- 12 |   |              |   | 15    (free)
+         ground -- GND|   |              |   | 13    UART1 TX -> TTGO 22
+                          +---[ USB-C ]--+
+
+   GPIO 21 is NOT present on this board, which is why the downstream TX is on 22.
    Each limit input = two NC switches in series + a 10k pull-up to 3.3V.
 ```
 
