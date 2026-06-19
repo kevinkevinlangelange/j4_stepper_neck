@@ -91,12 +91,12 @@ The StallGuard threshold (`SG_SGT`, `SG_STALL_LEVEL`), homing speed/back-off, an
 | 4 / 13 | Upstream UART1 RX / TX (to TTGO) |
 | 21 / 22 | Downstream UART2 TX / RX (to eyes board) |
 | 34 | neck-left limit switches (input, external pull-up) |
-| 35 | neck-right limit switches (input, external pull-up) |
-| 36 | neck-pivot limit switches (input, external pull-up) |
+| 36 | neck-right limit switches (input, external pull-up) |
+| 39 | neck-pivot limit switches (input, external pull-up) |
 
-The links and step/dir use plain bidirectional GPIOs (strapping pins 0/2/12/15 and flash pins 6-11 are avoided). The three limit inputs use the input-only pins 34/35/36, each with an external 10k pull-up to 3.3V.
+The links and step/dir use plain bidirectional GPIOs (strapping pins 0/2/12/15 and flash pins 6-11 are avoided). The three limit inputs use the input-only pins 34/36/39, each with an external 10k pull-up to 3.3V.
 
-Note: some of these LiPo dev boards route battery sense to GPIO35 (or an LED to GPIO2). Verify your board before wiring the neck-right limit to GPIO35; **GPIO39** is a free input-only pin to move it to if needed. Limit switches are not required for normal operation, so you can wire them later.
+GPIO 35 is deliberately left unused, because some of these LiPo dev boards route battery sense to it. Limit switches are not required for normal operation, so you can wire them whenever you add them.
 
 ## Pin diagram
 
@@ -111,7 +111,7 @@ Note: some of these LiPo dev boards route battery sense to GPIO35 (or an LED to 
    neck L STEP/DIR| 26 / 25                              |
    neck R STEP/DIR| 33 / 32          ---> 3x TMC5160T (neck L/R/pivot)
    neck P STEP/DIR| 27 / 14                              |
-   limit inputs <-| 34 (NL)  35 (NR)  36 (NP)            |
+   limit inputs <-| 34 (NL)  36 (NR)  39 (NP)            |
                   |        3V3   GND   VIN   VM(12-24V)  |
                   +--------------------------------------+
 

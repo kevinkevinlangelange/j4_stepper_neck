@@ -3,6 +3,7 @@
 //      v0_1 created:  2026-06-14 -- 0123 CDT -KL
 //      last updated:  2026-06-15 -- CDT
 //      last updated:  2026-06-17 -- CDT
+//      last updated:  2026-06-18 -- CDT
 //            author:  Kevin Lange
 //       description:  Neck stepper driver board for Johnny 4, on an ESP32-DEV
 //                     (WROOM) module. Drives the three neck steppers via BTT
@@ -39,6 +40,10 @@
 //                    v0_5 -- Also report the eyes-board link state upstream as an
 //                            "EY:<0/1>" line, so j4_receiver / j4_controller can show
 //                            j4_stepper_eyes connection on the status screen.
+//                    v0_6 -- Moved the limit inputs off GPIO 35 (NR 35->36, NP
+//                            36->39). GPIO 35 is left free because some LiPo dev
+//                            boards route battery sense to it. Limits are now
+//                            34 (NL) / 36 (NR) / 39 (NP).
 //
 //
 //
@@ -84,8 +89,9 @@
 //   22:  UART2 RX  <-- eyes GPIO13 (TX)
 //
 //  Limit switches (two NC switches per axis in SERIES -> one input each, with an
-//  external 10k pull-up to 3.3V; LOW = in range, HIGH = limit hit / broken wire):
-//   34:  neck-left  limits      35:  neck-right limits      36:  neck-pivot limits
+//  external 10k pull-up to 3.3V; LOW = in range, HIGH = limit hit / broken wire).
+//  GPIO 35 is left unused (some LiPo boards route battery sense to it):
+//   34:  neck-left  limits      36:  neck-right limits      39:  neck-pivot limits
 //
 //  StallGuard: read over SPI (no extra pins). During calibration each axis homes
 //  to a limit switch OR a StallGuard stall (so an axis already against a stop is
@@ -161,9 +167,11 @@
 // external 10k pull-up to 3.3V. LOW = both closed (in range); HIGH = a limit was
 // hit OR a wire broke (fail-safe). The travel direction tells which end. These
 // are input-only pins, so they need the external pull-up (no internal one).
+// GPIO 35 is deliberately left unused: some of these LiPo dev boards route
+// battery sense to it. The three limits use 34/36/39 instead.
 #define LIMIT_PIN_NL  34
-#define LIMIT_PIN_NR  35
-#define LIMIT_PIN_NP  36
+#define LIMIT_PIN_NR  36
+#define LIMIT_PIN_NP  39
 static inline bool limitHit(uint8_t pin) { return digitalRead(pin) == HIGH; }
 
 // StallGuard2 (read over SPI). sg_result() drops toward 0 under load; near 0 is a
