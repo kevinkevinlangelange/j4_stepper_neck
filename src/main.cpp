@@ -41,9 +41,12 @@
 //                            "EY:<0/1>" line, so j4_receiver / j4_controller can show
 //                            j4_stepper_eyes connection on the status screen.
 //                    v0_6 -- Moved the limit inputs off GPIO 35 (NR 35->36, NP
-//                            36->39). GPIO 35 is left free because some LiPo dev
-//                            boards route battery sense to it. Limits are now
-//                            34 (NL) / 36 (NR) / 39 (NP).
+//                            36->39). Limits are now 34 (NL) / 36 (NR) / 39 (NP).
+//                    v0_7 -- Confirmed the board is a bare ESP32-D0WD (LOLIN32-Lite
+//                            style): onboard LED on GPIO 22, no battery-sense pin.
+//                            Moved the downstream UART RX off the LED pin (GPIO 22
+//                            -> GPIO 35, input-only). DN_TX stays 21; GPIO 22 is
+//                            left free, and GPIO 35 is safe here (no battery sense).
 //
 //
 //
@@ -86,11 +89,12 @@
 //
 //  Downstream link to j4_stepper_eyes, UART2, 2-way:
 //   21:  UART2 TX  --> eyes GPIO4 (RX)
-//   22:  UART2 RX  <-- eyes GPIO13 (TX)
+//   35:  UART2 RX  <-- eyes GPIO13 (TX)   (input-only; keeps RX off the LED on 22)
+//
+//  GPIO 22 carries this board's onboard LED, so it is left unused by the firmware.
 //
 //  Limit switches (two NC switches per axis in SERIES -> one input each, with an
-//  external 10k pull-up to 3.3V; LOW = in range, HIGH = limit hit / broken wire).
-//  GPIO 35 is left unused (some LiPo boards route battery sense to it):
+//  external 10k pull-up to 3.3V; LOW = in range, HIGH = limit hit / broken wire):
 //   34:  neck-left  limits      36:  neck-right limits      39:  neck-pivot limits
 //
 //  StallGuard: read over SPI (no extra pins). During calibration each axis homes
@@ -141,9 +145,11 @@
 #define UP_RX_PIN      4
 #define UP_TX_PIN     13
 
-// Downstream link to the eyes board (UART2, 2-way)
+// Downstream link to the eyes board (UART2, 2-way).
+// RX is on GPIO 35 (input-only): this board (ESP32-D0WD) has no battery-sense pin,
+// and GPIO 22 carries the onboard LED, so keep the RX data line off 22.
 #define DN_TX_PIN     21
-#define DN_RX_PIN     22
+#define DN_RX_PIN     35
 
 #define LINK_BAUD 250000   // both links; must match j4_receiver and j4_stepper_eyes
 

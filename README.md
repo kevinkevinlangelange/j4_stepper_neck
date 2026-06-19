@@ -89,14 +89,14 @@ The StallGuard threshold (`SG_SGT`, `SG_STALL_LEVEL`), homing speed/back-off, an
 | 33 / 32 | neck-right STEP / DIR |
 | 27 / 14 | neck-pivot STEP / DIR |
 | 4 / 13 | Upstream UART1 RX / TX (to TTGO) |
-| 21 / 22 | Downstream UART2 TX / RX (to eyes board) |
+| 21 / 35 | Downstream UART2 TX / RX (to eyes board) |
 | 34 | neck-left limit switches (input, external pull-up) |
 | 36 | neck-right limit switches (input, external pull-up) |
 | 39 | neck-pivot limit switches (input, external pull-up) |
 
-The links and step/dir use plain bidirectional GPIOs (strapping pins 0/2/12/15 and flash pins 6-11 are avoided). The three limit inputs use the input-only pins 34/36/39, each with an external 10k pull-up to 3.3V.
+The board is a bare ESP32-D0WD (LOLIN32-Lite style). It has **no battery-sense pin**, so the input-only GPIO 35 is used for the downstream RX. Its **onboard LED is on GPIO 22**, which is therefore left unused. The step/dir and the upstream/downstream TX use plain bidirectional GPIOs (strapping pins 0/2/12/15 and flash pins 6-11 avoided). The three limit inputs use the input-only pins 34/36/39, each with an external 10k pull-up to 3.3V.
 
-GPIO 35 is deliberately left unused, because some of these LiPo dev boards route battery sense to it. Limit switches are not required for normal operation, so you can wire them whenever you add them.
+Limit switches are not required for normal operation, so you can wire them whenever you add them.
 
 ## Pin diagram
 
@@ -104,7 +104,7 @@ GPIO 35 is deliberately left unused, because some of these LiPo dev boards route
                    ESP32-DEV (WROOM)  -  j4_stepper_neck
                   +--------------------------------------+
    TTGO 21 (TX) ->| 4  (UART1 RX)        21 (UART2 TX) |-> eyes 4 (RX)
-   TTGO 22 (RX) <-| 13 (UART1 TX)        22 (UART2 RX) |<- eyes 13 (TX)
+   TTGO 22 (RX) <-| 13 (UART1 TX)        35 (UART2 RX) |<- eyes 13 (TX)
                   |                                      |
    TMC5160T SPI:  | 18 SCK   19 MISO   23 MOSI  (shared) |
      CS L/R/P  <--| 5        17        16               |
