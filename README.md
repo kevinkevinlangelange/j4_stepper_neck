@@ -1,4 +1,4 @@
-# j4_stepper_neck
+# j4_stepper
 
 Stepper driver board for the Johnny 4 robot -- the sole stepper node, driving all five steppers. Runs on an ESP32-DEV (WROOM) module. The three neck axes run on STEPPERONLINE DM556TE digital step/dir drivers, and the two eye-pop motors run on TMC2209 drivers over a shared UART. Step pulses run on the ESP32 RMT peripheral via FastAccelStepper, so the CPU never blocks.
 
@@ -10,7 +10,7 @@ The former [j4_stepper_eyes](https://github.com/kevinkevinlangelange/j4_stepper_
   j4_controller --ESP-NOW--> j4_receiver (TTGO)
                                   |  UART1 (2-way, 250000)
                                   v
-                          j4_stepper_neck   (3x DM556TE + 2x TMC2209)   <-- this board
+                          j4_stepper   (3x DM556TE + 2x TMC2209)   <-- this board
 ```
 
 ## What this board does
@@ -44,11 +44,10 @@ The DM556TE is a standalone driver: motor current and microstep resolution are s
 | in | `nL,nR,nP,eye\n` | neck L/R/pivot + eye-pop, all 0-3200 |
 | in | `CAL\n` | run a homing/calibration pass on all five axes |
 | out | `ST:<text>\n` | merged status, e.g. `ST:OK`, `ST:NL LIMIT`, `ST:EL OT`, `ST:EYES OFFLINE` |
-| out | `EY:<0/1>\n` | eye driver state (1 = both TMC2209s respond over UART) |
 
 The parser uses fixed char buffers (no Arduino `String`, so no heap fragmentation). A line that does not parse is ignored.
 
-`EY:` used to mean "is the downstream eyes board alive" when the eyes lived on their own ESP32; it now reports whether the two local TMC2209s answer on their UART. j4_receiver and j4_controller read it exactly the same way, so they need no changes.
+The old `EY:<0/1>` line (eyes-board link state, from when the eyes lived on their own ESP32) is gone: there is no separate link to report anymore, and an unreachable eye driver already surfaces as `ST:EYES OFFLINE`.
 
 ## Status reporting
 

@@ -1,5 +1,5 @@
 //******************************************************************************
-//         file name:  j4_stepper_neck.ino
+//         file name:  j4_stepper.ino
 //      v0_1 created:  2026-06-14 -- 0123 CDT -KL
 //      last updated:  2026-06-15 -- CDT
 //      last updated:  2026-06-17 -- CDT
@@ -12,7 +12,7 @@
 //                     STEPPERONLINE DM556TE digital step/dir drivers and the two
 //                     eye-pop motors via TMC2209 drivers. Sole stepper node:
 //
-//                       j4_receiver (TTGO) <--UART1--> [ j4_stepper_neck ]
+//                       j4_receiver (TTGO) <--UART1--> [ j4_stepper ]
 //
 //                     It parses "nL,nR,nP,eye" from the receiver, drives the neck
 //                     with nL/nR/nP and the eye-pop pair with eye. The DM556TE
@@ -74,6 +74,13 @@
 //                            whether the local TMC2209s respond over UART. One
 //                            calibrate() homes all five axes (eyes keep StallGuard4
 //                            stall detection). j4_stepper_eyes is retired.
+//                   v0_11 -- Renamed the project j4_stepper_neck -> j4_stepper (it is
+//                            the only stepper board now, so the _neck suffix was
+//                            stale). Dropped the "EY:<0/1>" status line: with the
+//                            eyes board gone there is no separate link to report,
+//                            and an unreachable eye driver already surfaces as
+//                            "ST:EYES OFFLINE". j4_receiver / j4_controller drop
+//                            their eyes_ok plumbing to match.
 //
 //
 //
@@ -88,7 +95,6 @@
 //
 //  UPSTREAM STATUS (to j4_receiver, UART1)
 //   "ST:<text>\n"   e.g. "ST:OK", "ST:NL LIMIT", "ST:EL OT", "ST:EYES OFFLINE"
-//   "EY:<0/1>\n"    eye driver state (1 = both TMC2209s respond over UART)
 //  ------------------------------------------------------------------
 //
 //
@@ -354,7 +360,7 @@ const char *faultToken2209(TMC2209Stepper &d) {
 // Poll everything that can fault. The DM556TE has no telemetry bus, so a neck
 // fault can only be a limit input reading HIGH (a switch is hit or its wire is
 // broken). The eye TMC2209s are polled over UART for driver faults and checked
-// for a working link (this feeds the "EY:" line upstream).
+// for a working link (an unreachable driver reports as "EYES OFFLINE").
 void pollFaults() {
   neckFault[0] = '\0';
   if      (limitHit(LIMIT_PIN_NL)) strncpy(neckFault, "NL LIMIT", sizeof(neckFault) - 1);
@@ -482,7 +488,7 @@ FastAccelStepper *connectStepper(uint8_t stepPin, uint8_t dirPin, int32_t startP
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("j4_stepper_neck booting...");
+  Serial.println("j4_stepper booting...");
 
   // --- Upstream link ---
   upSerial.begin(LINK_BAUD, SERIAL_8N1, UP_RX_PIN, UP_TX_PIN);   // to TTGO
@@ -510,7 +516,7 @@ void setup() {
   if (!stepper_NL || !stepper_NR || !stepper_NP || !stepper_EL || !stepper_ER) {
     Serial.println("WARNING: a stepperConnectToPin() failed -- check STEP pins");
   } else {
-    Serial.println("j4_stepper_neck ready -- 3 neck + 2 eye motors, waiting for packets");
+    Serial.println("j4_stepper ready -- 3 neck + 2 eye motors, waiting for packets");
   }
 }
 
@@ -547,12 +553,11 @@ void loop() {
     pollFaults();
   }
 
-  // Report merged status + the eye driver state upstream.
+  // Report the merged status upstream.
   if (now - lastStatusTx >= STATUS_TX_MS) {
     lastStatusTx = now;
     char status[24];
     buildStatus(status, sizeof(status));
     upSerial.printf("ST:%s\n", status);
-    upSerial.printf("EY:%d\n", eyesAlive ? 1 : 0);
   }
 }
