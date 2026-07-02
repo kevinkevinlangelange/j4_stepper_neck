@@ -5,25 +5,27 @@
 //      last updated:  2026-06-17 -- CDT
 //      last updated:  2026-06-18 -- CDT
 //      last updated:  2026-06-19 -- CDT
+//      last updated:  2026-07-02 -- CDT
 //            author:  Kevin Lange
 //       description:  Neck stepper driver board for Johnny 4, on an ESP32-DEV
-//                     (WROOM) module. Drives the three neck steppers via BTT
-//                     TMC5160T drivers and acts as the middle node of the stepper
-//                     daisy chain:
+//                     (WROOM) module. Drives the three neck steppers via
+//                     STEPPERONLINE DM556TE digital step/dir drivers and acts as
+//                     the middle node of the stepper daisy chain:
 //
 //                       j4_receiver (TTGO) <--UART1--> [ j4_stepper_neck ]
 //                                                              <--UART2--> j4_stepper_eyes
 //
 //                     It parses "nL,nR,nP,eye" from the receiver, drives the neck
 //                     with nL/nR/nP, and forwards the eye value downstream to the
-//                     eyes board. For status it polls each TMC5160T's DRV_STATUS
-//                     register (overtemp, short, open-load), merges that with the
-//                     eyes board's status (and a link-alive check), and reports a
-//                     single status string back upstream to the receiver.
+//                     eyes board. The DM556TE drivers are standalone: motor current
+//                     and microstep resolution are set by DIP switches on each
+//                     driver, and there is no status/telemetry bus back to the ESP32.
+//                     Neck health is therefore reported from the limit switches only;
+//                     that is merged with the eyes board's status (and a link-alive
+//                     check) into a single status string sent back upstream.
 //
 //                     Step pulses come from the ESP32 RMT peripheral via
-//                     FastAccelStepper (no CPU blocking); the TMC5160T drivers are
-//                     configured over software SPI.
+//                     FastAccelStepper (no CPU blocking).
 //       update log:  v0_1 -- Initial build (combined neck + eye board).
 //                    v0_2 -- Eye-pop bound to neck motion settings.
 //                    v0_3 -- Split into two boards. This board is neck-only now;
@@ -53,6 +55,18 @@
 //                            blink). Downstream is now TX 22 / RX 35. Redrew the
 //                            README pin diagram to the real physical pin layout and
 //                            added UART destination pins to the assignment table.
+//                    v0_9 -- Swapped the three neck drivers from BTT TMC5160T to
+//                            STEPPERONLINE DM556TE digital step/dir drivers. Removed
+//                            all SPI / TMCStepper / StallGuard / DRV_STATUS code: the
+//                            DM556TE is a standalone driver with no telemetry bus, so
+//                            current and microstepping are set by its DIP switches and
+//                            the step/dir pins now feed the driver's opto-isolated
+//                            PUL/DIR inputs. The six SPI pins (18/19/23 + CS 5/17/16)
+//                            are freed. Status now reports limit-switch faults only,
+//                            and homing relies on the limit switch plus a timeout (no
+//                            stall detection). Motion math is unchanged: set each
+//                            DM556TE to 3200 pulse/rev so one commanded unit is one
+//                            pulse, exactly like the old 16-microstep scale.
 //
 //
 //
@@ -66,7 +80,8 @@
 //   A line that does not parse is ignored.
 //
 //  UPSTREAM STATUS (to j4_receiver, UART1)
-//   "ST:<text>\n"   e.g. "ST:OK", "ST:NL OT", "ST:NL LIMIT", "ST:EYES OFFLINE"
+//   "ST:<text>\n"   e.g. "ST:OK", "ST:NL LIMIT", "ST:EYES OFFLINE"
+//   "EY:<0/1>\n"    eyes-board link state (1 = alive)
 //
 //  DOWNSTREAM (to j4_stepper_eyes, UART2)
 //   out: "<eye>\n"          the forwarded eye-pop value (0-3200)
@@ -76,15 +91,7 @@
 //
 //  ESP32-DEV (WROOM) Pin Connections
 //  ------------------------------------------------------------------
-//  TMC5160T software SPI (shared SCK/MISO/MOSI, one CS per driver):
-//   18:  SPI SCK   -- all three TMC5160T (shared)
-//   19:  SPI MISO  -- all three TMC5160T SDO (shared)
-//   23:  SPI MOSI  -- all three TMC5160T SDI (shared)
-//   05:  CS -- neck-left  TMC5160T
-//   17:  CS -- neck-right TMC5160T
-//   16:  CS -- neck-pivot TMC5160T
-//
-//  Neck step/dir:
+//  Neck step/dir (each pair feeds one DM556TE's PUL / DIR opto inputs):
 //   26:  STEP -- neck left      25:  DIR -- neck left
 //   33:  STEP -- neck right     32:  DIR -- neck right
 //   27:  STEP -- neck pivot     14:  DIR -- neck pivot
@@ -104,43 +111,50 @@
 //  external 10k pull-up to 3.3V; LOW = in range, HIGH = limit hit / broken wire):
 //   34:  neck-left  limits      36:  neck-right limits      39:  neck-pivot limits
 //
-//  StallGuard: read over SPI (no extra pins). During calibration each axis homes
-//  to a limit switch OR a StallGuard stall (so an axis already against a stop is
-//  caught at once). Thresholds in the code need tuning on the real mechanism.
+//  ------------------------------------------------------------------
+//  DM556TE DRIVER WIRING (per driver -- three identical)
+//  ------------------------------------------------------------------
+//  The DM556TE inputs are optically isolated (rated 5-24V, 7-20mA). Wire them
+//  COMMON-CATHODE / active-high so the ESP32's normal 3.3V logic drives them
+//  directly and the pulse/direction polarity stays normal (no firmware inversion):
 //
-//  Power / enable:
-//   3.3V -> all driver VIO       GND -> all driver GND (common with ESP32)
-//   12-24V PSU -> all driver VM  (PSU GND common with ESP32 GND)
-//   All driver EN pins tied to GND -- drivers always enabled.
+//   ESP32 STEP pin --> PUL+        ESP32 DIR pin --> DIR+
+//   PUL- --> ESP32 GND            DIR- --> ESP32 GND
+//   ENA+ / ENA-  left unconnected  (driver is enabled by default)
+//
+//  3.3V is at the low edge of the opto's 5V spec. It works on the bench, but if an
+//  axis drops pulses, add a 3.3V->5V level shifter on PUL/DIR, or drive the inputs
+//  common-anode from a 5V rail (which inverts polarity -- not used here).
+//
+//  DIP SWITCHES (set on each DM556TE, NOT in firmware):
+//   Current (SW1-3) + SW4 full/half: set to your motor. For the 2.1A neck motors
+//     use the 2.1A-peak / 1.5A-RMS row: SW1=on, SW2=off, SW3=off, SW4=on (full).
+//   Microstep (SW5-8): set 3200 pulse/rev -> SW5=on, SW6=on, SW7=off, SW8=on.
+//     This makes one commanded unit below equal one pulse (same as the old scale).
+//
+//  Motor: A+/A- to one phase, B+/B- to the other. If an axis runs the wrong way,
+//  swap that motor's A+/A- pair (or invert its DIR mapping in firmware).
+//
+//  Power:
+//   DM556TE +Vdc/GND -> 24-50VDC PSU  (PSU GND common with ESP32 GND)
 //  ------------------------------------------------------------------
 //
 //  NOTE: avoids strapping pins (0/2/12/15) for outputs and flash pins (6-11).
-//        On WROVER modules GPIO 16/17 are used by PSRAM -- this build targets
-//        a plain WROOM ESP32-DEV where 16/17 are free.
+//        The input-only pins 34/36/39 are used for the limit inputs.
 //
 //******************************************************************************
 
 
 
 #include <Arduino.h>
-#include <SPI.h>
 #include <HardwareSerial.h>
-#include <TMCStepper.h>
 #include "FastAccelStepper.h"
 
 
 // ---------------------------------------------------------------------------
 // PIN ASSIGNMENTS
 // ---------------------------------------------------------------------------
-// TMC5160T software SPI (shared bus)
-#define SPI_SCK_PIN   18
-#define SPI_MISO_PIN  19
-#define SPI_MOSI_PIN  23
-#define CS_PIN_NL      5   // neck left
-#define CS_PIN_NR     17   // neck right
-#define CS_PIN_NP     16   // neck pivot
-
-// Neck step/dir
+// Neck step/dir (each pair feeds one DM556TE PUL/DIR input)
 #define STEP_PIN_NL   26
 #define DIR_PIN_NL    25
 #define STEP_PIN_NR   33
@@ -163,54 +177,37 @@
 
 
 // ---------------------------------------------------------------------------
-// DRIVER + MOTION CONFIG  (matched to j4_motor_test_dev so the neck feels right)
+// MOTION CONFIG
 // ---------------------------------------------------------------------------
-#define R_SENSE_5160      0.075f  // BTT TMC5160T V1.0 sense resistor
-#define NECK_CURRENT      2100    // RMS mA -- motor rated current
-#define NECK_MICROSTEPS     16
-#define NECK_SPEED_HZ     3200    // microsteps/sec (16x) ~ 60 RPM on a 1.8deg motor
-#define NECK_ACCEL       16000    // microsteps/sec^2
+// Motor current and microstep resolution live on the DM556TE DIP switches, not
+// here. Set each driver to 3200 pulse/rev (SW5=on, SW6=on, SW7=off, SW8=on) so one
+// commanded unit below equals one step pulse -- identical to the old 16-microstep
+// math, so all the neck travel/threshold numbers carry over unchanged.
+#define NECK_SPEED_HZ     3200    // pulses/sec ~ 60 RPM at 3200 pulse/rev
+#define NECK_ACCEL       16000    // pulses/sec^2
 #define NECK_THRESHOLD      20    // min joystick-unit change (0-3200) to re-issue moveTo
 #define NECK_CENTER       1600    // joystick midpoint (0-3200)
 
 
 // ---------------------------------------------------------------------------
-// LIMIT SWITCHES + STALLGUARD
+// LIMIT SWITCHES
 // ---------------------------------------------------------------------------
 // Two normally-closed switches per axis wired IN SERIES to one input, with an
 // external 10k pull-up to 3.3V. LOW = both closed (in range); HIGH = a limit was
 // hit OR a wire broke (fail-safe). The travel direction tells which end. These
 // are input-only pins, so they need the external pull-up (no internal one).
-// GPIO 35 is deliberately left unused: some of these LiPo dev boards route
-// battery sense to it. The three limits use 34/36/39 instead.
 #define LIMIT_PIN_NL  34
 #define LIMIT_PIN_NR  36
 #define LIMIT_PIN_NP  39
 static inline bool limitHit(uint8_t pin) { return digitalRead(pin) == HIGH; }
 
-// StallGuard2 (read over SPI). sg_result() drops toward 0 under load; near 0 is a
-// stall. Used during calibration so an axis already jammed against a stop is
-// caught the moment it tries to move. THESE VALUES NEED HARDWARE TUNING.
-#define SG_SGT             8       // StallGuard2 threshold (-64..63); higher = less sensitive
-#define SG_TCOOLTHRS  0xFFFFF      // enable StallGuard above near-standstill speed
-#define SG_STALL_LEVEL    40       // sg_result below this counts as a stall (tune)
-
-// StallGuard stall check (valid while moving; do not rely on it at standstill).
-static inline bool stalled5160(TMC5160Stepper &drv) { return drv.sg_result() < SG_STALL_LEVEL; }
-
-// Homing/calibration tunables (per-hardware -- adjust on the bench).
+// Homing/calibration tunables (per-hardware -- adjust on the bench). Without a
+// driver telemetry bus there is no stall detection, so homing trusts the limit
+// switch plus the timeout below.
 #define HOMING_SPEED_HZ   800      // slow approach speed
 #define HOMING_ACCEL     8000
-#define HOMING_BACKOFF    200      // microsteps to back off after touching a limit
+#define HOMING_BACKOFF    200      // pulses to back off after touching a limit
 #define HOMING_TIMEOUT_MS 9000     // safety cap per axis
-
-
-// ---------------------------------------------------------------------------
-// DRIVERS  (software SPI: TMC5160Stepper(CS, RS, MOSI, MISO, SCK))
-// ---------------------------------------------------------------------------
-TMC5160Stepper tmc_NL(CS_PIN_NL, R_SENSE_5160, SPI_MOSI_PIN, SPI_MISO_PIN, SPI_SCK_PIN);
-TMC5160Stepper tmc_NR(CS_PIN_NR, R_SENSE_5160, SPI_MOSI_PIN, SPI_MISO_PIN, SPI_SCK_PIN);
-TMC5160Stepper tmc_NP(CS_PIN_NP, R_SENSE_5160, SPI_MOSI_PIN, SPI_MISO_PIN, SPI_SCK_PIN);
 
 
 // ---------------------------------------------------------------------------
@@ -238,13 +235,11 @@ char    dnBuf[48];  uint8_t dnLen = 0;
 char          eyesStatus[24] = "";      // last status text from the eyes board
 bool          eyesSeen       = false;   // have we ever heard from the eyes board?
 unsigned long eyesLastSeen   = 0;
-char          neckFault[24]  = "";      // current neck driver fault ("" = none)
+char          neckFault[24]  = "";      // current neck fault ("" = none)
 
 #define EYES_TIMEOUT_MS    800   // no eyes status for this long -> "EYES OFFLINE"
-#define POLL_INTERVAL_MS   100   // how often to read the neck DRV_STATUS registers
 #define STATUS_TX_MS       200   // how often to report status upstream
 
-unsigned long lastPoll     = 0;
 unsigned long lastStatusTx = 0;
 
 
@@ -293,24 +288,10 @@ void parseDownstream(const char *line) {
 }
 
 
-// Return a short fault token for one TMC5160T, most-severe first ("" = healthy).
-const char *faultToken5160(TMC5160Stepper &d) {
-  if (d.ot())                return "OT";     // overtemp shutdown
-  if (d.s2ga() || d.s2gb())  return "SHORT";  // short to ground
-  if (d.otpw())              return "OTPW";   // overtemp prewarning
-  if (d.ola()  || d.olb())   return "OPEN";   // open load / disconnected
-  return "";
-}
-
-
-// Poll the three neck drivers; record the first fault found (NL, then NR, then NP).
-void pollNeckFaults() {
-  const char *t;
+// The DM556TE has no telemetry bus, so a neck fault can only be a limit input
+// reading HIGH (a switch is hit or its wire is broken). Record the first found.
+void updateNeckFault() {
   neckFault[0] = '\0';
-  if ((t = faultToken5160(tmc_NL))[0]) { snprintf(neckFault, sizeof(neckFault), "NL %s", t); return; }
-  if ((t = faultToken5160(tmc_NR))[0]) { snprintf(neckFault, sizeof(neckFault), "NR %s", t); return; }
-  if ((t = faultToken5160(tmc_NP))[0]) { snprintf(neckFault, sizeof(neckFault), "NP %s", t); return; }
-  // A limit input reads HIGH when a switch is hit or its wire is broken.
   if (limitHit(LIMIT_PIN_NL)) { strncpy(neckFault, "NL LIMIT", sizeof(neckFault) - 1); return; }
   if (limitHit(LIMIT_PIN_NR)) { strncpy(neckFault, "NR LIMIT", sizeof(neckFault) - 1); return; }
   if (limitHit(LIMIT_PIN_NP)) { strncpy(neckFault, "NP LIMIT", sizeof(neckFault) - 1); return; }
@@ -326,10 +307,11 @@ void checkLimits() {
 
 
 // Home one axis: drive toward the home (negative) end until the limit switch trips
-// or StallGuard detects a hard stop (this catches an axis already against a stop),
-// then back off until the limit clears and zero the position. NEEDS HARDWARE
-// VALIDATION -- the direction, speed, backoff, and SG level are all tunable above.
-void homeAxis(FastAccelStepper *s, uint8_t limitPin, TMC5160Stepper &drv) {
+// or the timeout expires, back off until the limit clears, and zero the position.
+// With the DM556TE there is no stall detection, so an axis that starts jammed hard
+// against the HOME stop cannot be sensed -- it drives until the timeout, then goes
+// on. NEEDS HARDWARE VALIDATION: direction, speed, and backoff are tunable above.
+void homeAxis(FastAccelStepper *s, uint8_t limitPin) {
   if (!s) return;
   s->setSpeedInHz(HOMING_SPEED_HZ);
   s->setAcceleration(HOMING_ACCEL);
@@ -337,14 +319,12 @@ void homeAxis(FastAccelStepper *s, uint8_t limitPin, TMC5160Stepper &drv) {
   // Approach the home (negative) end. With one shared series input we can't tell
   // the two ends apart, so only trust the limit switch once we've seen it read
   // clear (LOW) at least once -- that way starting against the FAR limit just
-  // drives us off it and onward to home. StallGuard stops a real jam immediately
-  // (this is what catches an axis already pinned against the HOME stop at start).
+  // drives us off it and onward to home.
   s->move(-1000000);
   bool seenClear = !limitHit(limitPin);
   unsigned long t0 = millis();
   while (s->isRunning()) {
     if (!limitHit(limitPin))                  seenClear = true;
-    if (stalled5160(drv))                     { s->forceStop(); break; }
     if (seenClear && limitHit(limitPin))      { s->forceStop(); break; }
     if (millis() - t0 > HOMING_TIMEOUT_MS)    { s->forceStop(); break; }
     delay(1);
@@ -367,15 +347,15 @@ void homeAxis(FastAccelStepper *s, uint8_t limitPin, TMC5160Stepper &drv) {
 // Calibrate all neck axes, then ask the eyes board to calibrate too.
 void calibrate() {
   dnSerial.println("CAL");           // tell the eyes board to home as well
-  homeAxis(stepper_NL, LIMIT_PIN_NL, tmc_NL);
-  homeAxis(stepper_NR, LIMIT_PIN_NR, tmc_NR);
-  homeAxis(stepper_NP, LIMIT_PIN_NP, tmc_NP);
+  homeAxis(stepper_NL, LIMIT_PIN_NL);
+  homeAxis(stepper_NR, LIMIT_PIN_NR);
+  homeAxis(stepper_NP, LIMIT_PIN_NP);
   last_nL = last_nR = last_nP = NECK_CENTER;   // force a fresh move on next packet
 }
 
 
 // Build the single status string sent upstream. Priority: dead eyes link, then a
-// neck driver fault, then an eye driver fault, otherwise OK.
+// neck limit fault, then an eye driver fault, otherwise OK.
 void buildStatus(char *out, size_t n) {
   if (!eyesSeen || (millis() - eyesLastSeen) > EYES_TIMEOUT_MS) {
     strncpy(out, "EYES OFFLINE", n);
@@ -387,22 +367,6 @@ void buildStatus(char *out, size_t n) {
     strncpy(out, "OK", n);
   }
   out[n - 1] = '\0';
-}
-
-
-void configTmc5160(TMC5160Stepper &drv) {
-  drv.begin();
-  drv.GSTAT(0);          // clear latched fault flags
-  drv.toff(4);           // chopper off time (0 disables the driver)
-  drv.blank_time(24);
-  drv.rms_current(NECK_CURRENT);
-  drv.microsteps(NECK_MICROSTEPS);
-  drv.en_pwm_mode(true); // StealthChop
-  drv.pwm_autoscale(true);
-  // StallGuard2 (used during calibration; needs tuning on real hardware)
-  drv.TCOOLTHRS(SG_TCOOLTHRS);
-  drv.sgt(SG_SGT);
-  drv.sfilt(true);
 }
 
 
@@ -432,12 +396,7 @@ void setup() {
   pinMode(LIMIT_PIN_NR, INPUT);
   pinMode(LIMIT_PIN_NP, INPUT);
 
-  // --- TMC5160T neck drivers over software SPI ---
-  configTmc5160(tmc_NL);
-  configTmc5160(tmc_NR);
-  configTmc5160(tmc_NP);
-
-  // --- Step generators ---
+  // --- Step generators (DM556TE PUL/DIR are driven straight from these) ---
   engine.init();
   stepper_NL = connectStepper(STEP_PIN_NL, DIR_PIN_NL, neckTargetInv(NECK_CENTER));
   stepper_NR = connectStepper(STEP_PIN_NR, DIR_PIN_NR, neckTarget(NECK_CENTER));
@@ -446,7 +405,7 @@ void setup() {
   if (!stepper_NL || !stepper_NR || !stepper_NP) {
     Serial.println("WARNING: a stepperConnectToPin() failed -- check STEP pins");
   } else {
-    Serial.println("j4_stepper_neck ready -- 3 neck motors, waiting for packets");
+    Serial.println("j4_stepper_neck ready -- 3 neck motors (DM556TE), waiting for packets");
   }
 }
 
@@ -491,15 +450,10 @@ void loop() {
 
   unsigned long now = millis();
 
-  // Poll the neck drivers' fault registers.
-  if (now - lastPoll >= POLL_INTERVAL_MS) {
-    lastPoll = now;
-    pollNeckFaults();
-  }
-
   // Report merged status + the eyes-board link state upstream.
   if (now - lastStatusTx >= STATUS_TX_MS) {
     lastStatusTx = now;
+    updateNeckFault();
     char status[24];
     buildStatus(status, sizeof(status));
     upSerial.printf("ST:%s\n", status);
