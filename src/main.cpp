@@ -1,26 +1,30 @@
 //******************************************************************************
-//         file name:  j4_stepper.ino
+//         file name:  j4_stepper_neck.ino
 //      v0_1 created:  2026-06-14 -- 0123 CDT -KL
 //      last updated:  2026-06-15 -- CDT
 //      last updated:  2026-06-17 -- CDT
 //      last updated:  2026-06-18 -- CDT
 //      last updated:  2026-06-19 -- CDT
 //      last updated:  2026-07-02 -- CDT
+//      last updated:  2026-07-03 -- CDT
 //            author:  Kevin Lange
-//       description:  Stepper driver board for Johnny 4, on an ESP32-DEV (WROOM)
-//                     module. Drives ALL FIVE steppers: the three neck axes via
-//                     STEPPERONLINE DM556TE digital step/dir drivers and the two
-//                     eye-pop motors via TMC2209 drivers. Sole stepper node:
+//       description:  Neck stepper driver board for Johnny 4, on an ESP32-DEV
+//                     (WROOM) module. Drives the three neck steppers via
+//                     STEPPERONLINE DM556TE digital step/dir drivers and acts as
+//                     the middle node of the stepper daisy chain:
 //
-//                       j4_receiver (TTGO) <--UART1--> [ j4_stepper ]
+//                       j4_receiver (TTGO) <--UART1--> [ j4_stepper_neck ]
+//                                                              <--UART2--> j4_stepper_eyes
 //
 //                     It parses "nL,nR,nP,eye" from the receiver, drives the neck
-//                     with nL/nR/nP and the eye-pop pair with eye. The DM556TE
-//                     drivers are standalone (current/microsteps on DIP switches,
-//                     no telemetry), so neck health comes from the limit switches
-//                     only. The TMC2209s are polled for faults over their shared
-//                     UART, and everything is merged into a single status string
-//                     sent back upstream.
+//                     with nL/nR/nP, and forwards the eye value downstream to the
+//                     eyes board. The DM556TE drivers are standalone (current and
+//                     microsteps on DIP switches, no telemetry), so neck health
+//                     comes from the limit switches: each axis has its OWN input
+//                     per endpoint (six total), so faults name the exact switch
+//                     ("NL MIN", "NP MAX", ...). That is merged with the eyes
+//                     board's status (and a link-alive check) into a single status
+//                     string sent back upstream.
 //
 //                     Step pulses come from the ESP32 RMT peripheral via
 //                     FastAccelStepper (no CPU blocking).
@@ -65,22 +69,23 @@
 //                            stall detection). Motion math is unchanged: set each
 //                            DM556TE to 3200 pulse/rev so one commanded unit is one
 //                            pulse, exactly like the old 16-microstep scale.
-//                   v0_10 -- Absorbed j4_stepper_eyes: the two eye-pop TMC2209s now
-//                            live on this board, on the pins the DM556TE swap freed
-//                            (EL step/dir 18/19, ER step/dir 23/5, TMC2209 UART on
-//                            17/16, limits EL 35 / ER 22). The downstream UART link,
-//                            its protocol, and the eyes-status relay are gone; the
-//                            eye value is driven locally and "EY:<0/1>" now reports
-//                            whether the local TMC2209s respond over UART. One
-//                            calibrate() homes all five axes (eyes keep StallGuard4
-//                            stall detection). j4_stepper_eyes is retired.
-//                   v0_11 -- Renamed the project j4_stepper_neck -> j4_stepper (it is
-//                            the only stepper board now, so the _neck suffix was
-//                            stale). Dropped the "EY:<0/1>" status line: with the
-//                            eyes board gone there is no separate link to report,
-//                            and an unreachable eye driver already surfaces as
-//                            "ST:EYES OFFLINE". j4_receiver / j4_controller drop
-//                            their eyes_ok plumbing to match.
+//                   v0_10 -- Absorbed j4_stepper_eyes onto this board (the project
+//                            was briefly renamed j4_stepper).
+//                   v0_11 -- Dropped the "EY:" status line while consolidated.
+//                   v0_12 -- Split back into two boards (j4_stepper_neck +
+//                            j4_stepper_eyes) and renamed back. The pins freed by
+//                            moving the eyes off-board now give every limit switch
+//                            its OWN input: one switch per axis endpoint, six
+//                            inputs total, so faults name the exact switch ("NL
+//                            MIN", "NP MAX", ...). MIN (home) ends on the
+//                            input-only pins 34/36/39 (external 10k pull-ups); MAX
+//                            ends on 18/19/23 (internal pull-ups). Homing now
+//                            detects "already sitting on the home switch" directly
+//                            and backs off first -- no stall sensing needed. Mid-
+//                            move safety is direction-aware: only a move TOWARD a
+//                            tripped end is stopped, so an axis can always drive
+//                            itself back off a limit. The downstream link (TX 22 /
+//                            RX 35), eyes status relay, and "EY:<0/1>" are back.
 //
 //
 //
@@ -89,12 +94,18 @@
 //  ------------------------------------------------------------------
 //   "nL,nR,nP,eye\n"   four comma-separated integers, newline terminated
 //     nL  -- neck left   (0-3200)     nR  -- neck right (0-3200)
-//     nP  -- neck pivot  (0-3200)     eye -- eye-pop    (0-3200)
-//   "CAL\n"            run a homing/calibration pass on all five axes
+//     nP  -- neck pivot  (0-3200)     eye -- eye-pop    (0-3200), forwarded down
+//   "CAL\n"            run a homing/calibration pass (also forwarded downstream)
 //   A line that does not parse is ignored.
 //
 //  UPSTREAM STATUS (to j4_receiver, UART1)
-//   "ST:<text>\n"   e.g. "ST:OK", "ST:NL LIMIT", "ST:EL OT", "ST:EYES OFFLINE"
+//   "ST:<text>\n"   e.g. "ST:OK", "ST:NL MIN", "ST:NP MAX", "ST:EYES OFFLINE"
+//   "EY:<0/1>\n"    eyes-board link state (1 = alive)
+//
+//  DOWNSTREAM (to j4_stepper_eyes, UART2)
+//   out: "<eye>\n"          the forwarded eye-pop value (0-3200)
+//   out: "CAL\n"            tell the eyes board to calibrate too
+//   in:  "S:<text>\n"       the eyes board's status ("S:OK", "S:EL MIN", ...)
 //  ------------------------------------------------------------------
 //
 //
@@ -105,29 +116,28 @@
 //   33:  STEP -- neck right     32:  DIR -- neck right
 //   27:  STEP -- neck pivot     14:  DIR -- neck pivot
 //
-//  Eye-pop step/dir (one TMC2209 per eye, independent channels):
-//   18:  STEP -- eye left       19:  DIR -- eye left
-//   23:  STEP -- eye right      05:  DIR -- eye right
-//
-//  TMC2209 single-wire UART (shared bus, addressed via MS1/MS2 straps):
-//   17:  UART2 TX -- TMC2209 PDN_UART (via 1k to each driver)
-//   16:  UART2 RX -- TMC2209 PDN_UART
-//        addresses: eye-left = 0b00, eye-right = 0b01
-//
 //  Upstream link to j4_receiver (TTGO), UART1, 2-way:
 //   04:  UART1 RX  <-- TTGO GPIO21 (TX)
 //   13:  UART1 TX  --> TTGO GPIO22 (RX)
 //
-//  Limit switches (two NC switches per axis in SERIES -> one input each, with an
-//  external 10k pull-up to 3.3V; LOW = in range, HIGH = limit hit / broken wire):
-//   34:  neck-left  limits      36:  neck-right limits      39:  neck-pivot limits
-//   35:  eye-left   limits      22:  eye-right  limits
+//  Downstream link to j4_stepper_eyes, UART2, 2-way:
+//   22:  UART2 TX  --> eyes GPIO4 (RX)    (also drives the onboard LED = TX blink)
+//   35:  UART2 RX  <-- eyes GPIO13 (TX)   (input-only)
 //
-//  GPIO 22 also carries the onboard LED, so the LED doubles as an eye-right limit
-//  indicator (lit = in range, dark = limit hit, with the usual active-low wiring).
+//  NOTE: this board (ESP32-D0WD) does NOT break out GPIO21, so the downstream TX
+//        is on GPIO22 (which carries the onboard LED -- a handy TX-activity blink).
+//
+//  Limit switches -- ONE NC switch per axis endpoint, six inputs total. Each
+//  switch connects its input to GND; closed (in range) = LOW, open (limit hit
+//  OR broken wire) = HIGH, fail-safe. MIN = the home end an axis drives toward
+//  during CAL; MAX = the far end.
+//   MIN (input-only pins, external 10k pull-up to 3.3V):
+//    34:  neck-left MIN          36:  neck-right MIN         39:  neck-pivot MIN
+//   MAX (ordinary pins, internal pull-ups -- no external resistor needed):
+//    18:  neck-left MAX          19:  neck-right MAX         23:  neck-pivot MAX
 //
 //  ------------------------------------------------------------------
-//  DM556TE DRIVER WIRING (per neck driver -- three identical)
+//  DM556TE DRIVER WIRING (per driver -- three identical)
 //  ------------------------------------------------------------------
 //  The DM556TE inputs are optically isolated (rated 5-24V, 7-20mA). Wire them
 //  COMMON-CATHODE / active-high so the ESP32's normal 3.3V logic drives them
@@ -152,12 +162,10 @@
 //
 //  Power:
 //   DM556TE +Vdc/GND -> 24-50VDC PSU  (PSU GND common with ESP32 GND)
-//   TMC2209 VIO -> 3.3V, VM -> 12-24V PSU, EN tied to GND (always enabled)
 //  ------------------------------------------------------------------
 //
 //  NOTE: avoids strapping pins (0/2/12/15) for outputs and flash pins (6-11).
-//        The input-only pins 34/35/36/39 carry four of the five limit inputs;
-//        the fifth (eye-right) is on the ordinary GPIO 22.
+//        Pins 5/16/17 are free.
 //
 //******************************************************************************
 
@@ -165,7 +173,6 @@
 
 #include <Arduino.h>
 #include <HardwareSerial.h>
-#include <TMCStepper.h>
 #include "FastAccelStepper.h"
 
 
@@ -180,25 +187,22 @@
 #define STEP_PIN_NP   27
 #define DIR_PIN_NP    14
 
-// Eye-pop step/dir (one TMC2209 per eye, on the pins the DM556TE swap freed)
-#define STEP_PIN_EL   18
-#define DIR_PIN_EL    19
-#define STEP_PIN_ER   23
-#define DIR_PIN_ER     5
-
-// TMC2209 single-wire UART bus (both drivers share it, addressed via MS1/MS2)
-#define TMC2209_TX    17
-#define TMC2209_RX    16
-
 // Upstream link to the TTGO receiver (UART1, 2-way)
 #define UP_RX_PIN      4
 #define UP_TX_PIN     13
 
-#define LINK_BAUD 250000   // must match j4_receiver
+// Downstream link to the eyes board (UART2, 2-way).
+// This board (ESP32-D0WD) does NOT break out GPIO21, so the downstream TX uses
+// GPIO22 -- which also drives the onboard LED, giving a free TX-activity blink.
+// RX is GPIO35 (input-only); this board has no battery-sense pin to conflict.
+#define DN_TX_PIN     22
+#define DN_RX_PIN     35
+
+#define LINK_BAUD 250000   // both links; must match j4_receiver and j4_stepper_eyes
 
 
 // ---------------------------------------------------------------------------
-// MOTION CONFIG -- NECK (DM556TE)
+// MOTION CONFIG
 // ---------------------------------------------------------------------------
 // Motor current and microstep resolution live on the DM556TE DIP switches, not
 // here. Set each driver to 3200 pulse/rev (SW5=on, SW6=on, SW7=off, SW8=on) so one
@@ -211,45 +215,26 @@
 
 
 // ---------------------------------------------------------------------------
-// MOTION CONFIG -- EYES (TMC2209)
+// LIMIT SWITCHES -- one NC switch per axis endpoint (six inputs).
 // ---------------------------------------------------------------------------
-// Eye-pop motion matches the neck so it has the same smooth ramp. Only the
-// driver current is separate (small eye motors).
-#define R_SENSE_2209    0.11f   // typical BTT/FYSETC TMC2209 sense resistor -- verify on your board
-#define EYE_CURRENT      800    // RMS mA -- tune to your eye-pop motors
-#define EYE_MICROSTEPS    16
-#define EYE_SPEED_HZ    3200    // same as the neck
-#define EYE_ACCEL      16000    // same as the neck
-#define EYE_THRESHOLD     20    // min change (0-3200 scale) to re-issue moveTo
-
-
-// ---------------------------------------------------------------------------
-// LIMIT SWITCHES
-// ---------------------------------------------------------------------------
-// Two normally-closed switches per axis wired IN SERIES to one input, with an
-// external 10k pull-up to 3.3V. LOW = both closed (in range); HIGH = a limit was
-// hit OR a wire broke (fail-safe). The travel direction tells which end. Pins
-// 34/35/36/39 are input-only (no internal pull-up -- hence the external ones);
-// eye-right rides on the ordinary GPIO 22, whose onboard LED becomes a free
-// in-range indicator.
-#define LIMIT_PIN_NL  34
-#define LIMIT_PIN_NR  36
-#define LIMIT_PIN_NP  39
-#define LIMIT_PIN_EL  35
-#define LIMIT_PIN_ER  22
+// Each switch shorts its input to GND while the axis is in range: LOW = in
+// range, HIGH = that endpoint was hit OR its wire broke (fail-safe). Since every
+// endpoint has its own input, faults can name the exact switch.
+// MIN = the home end (CAL drives toward it); MAX = the far end.
+// The MIN inputs are on input-only pins (34/36/39), which have no internal
+// pull-up -- they need an external 10k to 3.3V. The MAX inputs (18/19/23) are
+// ordinary GPIOs and use the internal pull-up: no external resistor needed.
+#define LIMIT_PIN_NL_MIN  34
+#define LIMIT_PIN_NR_MIN  36
+#define LIMIT_PIN_NP_MIN  39
+#define LIMIT_PIN_NL_MAX  18
+#define LIMIT_PIN_NR_MAX  19
+#define LIMIT_PIN_NP_MAX  23
 static inline bool limitHit(uint8_t pin) { return digitalRead(pin) == HIGH; }
 
-// StallGuard4 on the eye TMC2209s (read over UART). SG_RESULT drops toward 0
-// under load; near 0 is a stall. Used during calibration so an eye already jammed
-// against a stop is caught the moment it tries to move. The DM556TE neck drivers
-// have no stall detection -- neck homing trusts the limit switch plus the timeout.
-// THESE VALUES NEED HARDWARE TUNING.
-#define SG_SGTHRS         60       // StallGuard4 threshold (0-255); higher = more sensitive
-#define SG_TCOOLTHRS  0xFFFFF      // enable StallGuard above near-standstill speed
-#define SG_STALL_LEVEL    40       // SG_RESULT below this counts as a stall (tune)
-static inline bool stalled2209(TMC2209Stepper &drv) { return drv.SG_RESULT() < SG_STALL_LEVEL; }
-
-// Homing/calibration tunables (per-hardware -- adjust on the bench).
+// Homing/calibration tunables (per-hardware -- adjust on the bench). Homing
+// drives toward the MIN switch; an axis already sitting on it is detected
+// directly (the switch reads pressed) and backs off first.
 #define HOMING_SPEED_HZ   800      // slow approach speed
 #define HOMING_ACCEL     8000
 #define HOMING_BACKOFF    200      // pulses to back off after touching a limit
@@ -257,55 +242,41 @@ static inline bool stalled2209(TMC2209Stepper &drv) { return drv.SG_RESULT() < S
 
 
 // ---------------------------------------------------------------------------
-// EYE DRIVERS (shared UART, separate addresses)
-// ---------------------------------------------------------------------------
-HardwareSerial tmcSerial(2);  // UART2 -> TMC2209 PDN_UART bus
-TMC2209Stepper tmc_EL(&tmcSerial, R_SENSE_2209, 0b00);
-TMC2209Stepper tmc_ER(&tmcSerial, R_SENSE_2209, 0b01);
-
-
-// ---------------------------------------------------------------------------
-// STEP GENERATORS (FastAccelStepper -- RMT hardware, no CPU blocking).
-// The two eye channels are independent so they can be trimmed/homed separately,
-// but both are commanded to the same target.
+// STEP GENERATORS (FastAccelStepper -- RMT hardware, no CPU blocking)
 // ---------------------------------------------------------------------------
 FastAccelStepperEngine engine;
 FastAccelStepper *stepper_NL = NULL;
 FastAccelStepper *stepper_NR = NULL;
 FastAccelStepper *stepper_NP = NULL;
-FastAccelStepper *stepper_EL = NULL;
-FastAccelStepper *stepper_ER = NULL;
 
-int last_nL  = NECK_CENTER;
-int last_nR  = NECK_CENTER;
-int last_nP  = NECK_CENTER;
-int last_eye = 0;
+int last_nL = NECK_CENTER;
+int last_nR = NECK_CENTER;
+int last_nP = NECK_CENTER;
 
 
 // ---------------------------------------------------------------------------
-// UPSTREAM LINK (UART1) + fixed-buffer parser (no Arduino String -> no heap churn)
+// LINKS + parsers (fixed buffers, no Arduino String -> no heap churn)
 // ---------------------------------------------------------------------------
 HardwareSerial upSerial(1);   // UART1 -> TTGO receiver
+HardwareSerial dnSerial(2);   // UART2 -> eyes board
 char    upBuf[48];  uint8_t upLen = 0;
+char    dnBuf[48];  uint8_t dnLen = 0;
 
 // Status plumbing
-char neckFault[24] = "";   // current neck limit fault ("" = none)
-char eyeFault[24]  = "";   // current eye driver/limit fault ("" = none)
-bool eyesAlive     = false; // both TMC2209s responding over UART?
+char          eyesStatus[24] = "";      // last status text from the eyes board
+bool          eyesSeen       = false;   // have we ever heard from the eyes board?
+unsigned long eyesLastSeen   = 0;
+char          neckFault[24]  = "";      // current neck limit fault ("" = none)
 
-#define POLL_INTERVAL_MS   100   // how often to poll the TMC2209s + limit inputs
+#define EYES_TIMEOUT_MS    800   // no eyes status for this long -> "EYES OFFLINE"
 #define STATUS_TX_MS       200   // how often to report status upstream
 
-unsigned long lastPoll     = 0;
 unsigned long lastStatusTx = 0;
 
 
 // Neck travel is half a joystick range; neck-left runs inverted (as in j4_receiver).
 static inline int32_t neckTarget(int joy)    { return (int32_t)joy / 2; }
 static inline int32_t neckTargetInv(int joy) { return (int32_t)(3200 - joy) / 2; }
-
-// Eye-pop travel maps the same way (half a 0-3200 range).
-static inline int32_t eyeTarget(int eye)     { return (int32_t)eye / 2; }
 
 
 void applyNeck(int nL, int nR, int nP) {
@@ -324,133 +295,119 @@ void applyNeck(int nL, int nR, int nP) {
 }
 
 
-// Drive both eyes to the same target (one move command per channel).
-void applyEye(int eye) {
-  if (abs(eye - last_eye) < EYE_THRESHOLD) return;
-  last_eye = eye;
-  int32_t tgt = eyeTarget(eye);
-  if (stepper_EL) stepper_EL->moveTo(tgt);
-  if (stepper_ER) stepper_ER->moveTo(tgt);
-}
-
-
 bool calRequested = false;
 
-// Parse "nL,nR,nP,eye" (drive all five axes) or "CAL" (request calibration).
+// Parse "nL,nR,nP,eye" (drive neck + forward eye) or "CAL" (request calibration).
 void parseUpstream(const char *line) {
   if (strcmp(line, "CAL") == 0) { calRequested = true; return; }
   int nL, nR, nP, eye;
   if (sscanf(line, "%d,%d,%d,%d", &nL, &nR, &nP, &eye) == 4) {
     applyNeck(nL, nR, nP);
-    applyEye(eye);
+    dnSerial.printf("%d\n", eye);   // relay to the eyes board
   }
 }
 
 
-// Return a short fault token for one TMC2209, most-severe first ("" = healthy).
-const char *faultToken2209(TMC2209Stepper &d) {
-  if (d.ot())                                         return "OT";     // overtemp shutdown
-  if (d.s2ga() || d.s2gb() || d.s2vsa() || d.s2vsb()) return "SHORT";  // short ground/supply
-  if (d.otpw())                                       return "OTPW";   // overtemp prewarning
-  if (d.ola()  || d.olb())                            return "OPEN";   // open load
-  return "";
+// Parse "S:<text>" from the eyes board.
+void parseDownstream(const char *line) {
+  if (line[0] == 'S' && line[1] == ':') {
+    strncpy(eyesStatus, line + 2, sizeof(eyesStatus) - 1);
+    eyesStatus[sizeof(eyesStatus) - 1] = '\0';
+    eyesSeen     = true;
+    eyesLastSeen = millis();
+  }
 }
 
 
-// Poll everything that can fault. The DM556TE has no telemetry bus, so a neck
-// fault can only be a limit input reading HIGH (a switch is hit or its wire is
-// broken). The eye TMC2209s are polled over UART for driver faults and checked
-// for a working link (an unreachable driver reports as "EYES OFFLINE").
-void pollFaults() {
+// With one input per endpoint the fault can name the exact switch. Record the
+// first one found (a HIGH input = switch hit or its wire broke).
+void updateNeckFault() {
   neckFault[0] = '\0';
-  if      (limitHit(LIMIT_PIN_NL)) strncpy(neckFault, "NL LIMIT", sizeof(neckFault) - 1);
-  else if (limitHit(LIMIT_PIN_NR)) strncpy(neckFault, "NR LIMIT", sizeof(neckFault) - 1);
-  else if (limitHit(LIMIT_PIN_NP)) strncpy(neckFault, "NP LIMIT", sizeof(neckFault) - 1);
-
-  eyesAlive = (tmc_EL.test_connection() == 0) && (tmc_ER.test_connection() == 0);
-
-  const char *t;
-  eyeFault[0] = '\0';
-  if      ((t = faultToken2209(tmc_EL))[0]) snprintf(eyeFault, sizeof(eyeFault), "EL %s", t);
-  else if ((t = faultToken2209(tmc_ER))[0]) snprintf(eyeFault, sizeof(eyeFault), "ER %s", t);
-  else if (limitHit(LIMIT_PIN_EL))          strncpy(eyeFault, "EL LIMIT", sizeof(eyeFault) - 1);
-  else if (limitHit(LIMIT_PIN_ER))          strncpy(eyeFault, "ER LIMIT", sizeof(eyeFault) - 1);
+  if      (limitHit(LIMIT_PIN_NL_MIN)) strncpy(neckFault, "NL MIN", sizeof(neckFault) - 1);
+  else if (limitHit(LIMIT_PIN_NL_MAX)) strncpy(neckFault, "NL MAX", sizeof(neckFault) - 1);
+  else if (limitHit(LIMIT_PIN_NR_MIN)) strncpy(neckFault, "NR MIN", sizeof(neckFault) - 1);
+  else if (limitHit(LIMIT_PIN_NR_MAX)) strncpy(neckFault, "NR MAX", sizeof(neckFault) - 1);
+  else if (limitHit(LIMIT_PIN_NP_MIN)) strncpy(neckFault, "NP MIN", sizeof(neckFault) - 1);
+  else if (limitHit(LIMIT_PIN_NP_MAX)) strncpy(neckFault, "NP MAX", sizeof(neckFault) - 1);
 }
 
 
-// Safety: if an axis is moving and its limit trips, stop it immediately.
+// Safety: if an axis is moving TOWARD a tripped endpoint, stop it. Knowing which
+// end tripped means a move away from the switch is still allowed, so an axis can
+// always drive itself back off a limit.
+void checkAxisLimits(FastAccelStepper *s, uint8_t minPin, uint8_t maxPin) {
+  if (!s || !s->isRunning()) return;
+  bool movingDown = s->targetPos() < s->getCurrentPosition();
+  if (movingDown  && limitHit(minPin)) s->forceStop();
+  if (!movingDown && limitHit(maxPin)) s->forceStop();
+}
+
 void checkLimits() {
-  if (stepper_NL && stepper_NL->isRunning() && limitHit(LIMIT_PIN_NL)) stepper_NL->forceStop();
-  if (stepper_NR && stepper_NR->isRunning() && limitHit(LIMIT_PIN_NR)) stepper_NR->forceStop();
-  if (stepper_NP && stepper_NP->isRunning() && limitHit(LIMIT_PIN_NP)) stepper_NP->forceStop();
-  if (stepper_EL && stepper_EL->isRunning() && limitHit(LIMIT_PIN_EL)) stepper_EL->forceStop();
-  if (stepper_ER && stepper_ER->isRunning() && limitHit(LIMIT_PIN_ER)) stepper_ER->forceStop();
+  checkAxisLimits(stepper_NL, LIMIT_PIN_NL_MIN, LIMIT_PIN_NL_MAX);
+  checkAxisLimits(stepper_NR, LIMIT_PIN_NR_MIN, LIMIT_PIN_NR_MAX);
+  checkAxisLimits(stepper_NP, LIMIT_PIN_NP_MIN, LIMIT_PIN_NP_MAX);
 }
 
 
-// Home one axis: drive toward the home (negative) end until the limit switch
-// trips, StallGuard detects a hard stop (eye axes only -- pass NULL for the neck,
-// whose DM556TEs have no stall detection), or the timeout expires; then back off
-// until the limit clears and zero the position. NEEDS HARDWARE VALIDATION -- the
-// direction, speed, backoff, and SG level are all tunable above.
-void homeAxis(FastAccelStepper *s, uint8_t limitPin, TMC2209Stepper *drv,
-              uint32_t runSpeed, int32_t runAccel) {
+// Home one axis toward its MIN switch. With a dedicated input per endpoint an
+// axis already sitting on the home switch is detected immediately (no stall
+// sensing needed): it just backs off until the switch releases, then zeros.
+// NEEDS HARDWARE VALIDATION -- direction, speed, and backoff are tunable above.
+void homeAxis(FastAccelStepper *s, uint8_t minPin, uint8_t maxPin) {
   if (!s) return;
   s->setSpeedInHz(HOMING_SPEED_HZ);
   s->setAcceleration(HOMING_ACCEL);
-
-  // Approach the home (negative) end. With one shared series input we can't tell
-  // the two ends apart, so only trust the limit switch once we've seen it read
-  // clear (LOW) at least once -- that way starting against the FAR limit just
-  // drives us off it and onward to home. On the eye axes, StallGuard stops a real
-  // jam immediately (this catches an eye already pinned against the HOME stop).
-  s->move(-1000000);
-  bool seenClear = !limitHit(limitPin);
   unsigned long t0 = millis();
-  while (s->isRunning()) {
-    if (!limitHit(limitPin))                  seenClear = true;
-    if (drv && stalled2209(*drv))             { s->forceStop(); break; }
-    if (seenClear && limitHit(limitPin))      { s->forceStop(); break; }
-    if (millis() - t0 > HOMING_TIMEOUT_MS)    { s->forceStop(); break; }
-    delay(1);
-  }
-  delay(50);
 
-  // Back off until the limit clears, then zero here.
+  // Approach the MIN end unless we are already pressing its switch.
+  if (!limitHit(minPin)) {
+    s->move(-1000000);
+    while (s->isRunning()) {
+      if (limitHit(minPin))                  { s->forceStop(); break; }
+      if (limitHit(maxPin))                  { s->forceStop(); break; }  // wrong end / wiring fault
+      if (millis() - t0 > HOMING_TIMEOUT_MS) { s->forceStop(); break; }
+      delay(1);
+    }
+    delay(50);
+  }
+
+  // Back off until the MIN switch releases (retry in fixed nudges), then zero.
   s->setCurrentPosition(0);
-  s->move(HOMING_BACKOFF);
   t0 = millis();
-  while (s->isRunning() && (millis() - t0 < HOMING_TIMEOUT_MS)) delay(1);
+  while (limitHit(minPin) && (millis() - t0 < HOMING_TIMEOUT_MS)) {
+    s->move(HOMING_BACKOFF);
+    while (s->isRunning() && limitHit(minPin) &&
+           (millis() - t0 < HOMING_TIMEOUT_MS)) delay(1);
+  }
+  s->forceStop();
+  delay(50);
   s->setCurrentPosition(0);
 
   // Restore normal motion settings.
-  s->setSpeedInHz(runSpeed);
-  s->setAcceleration(runAccel);
+  s->setSpeedInHz(NECK_SPEED_HZ);
+  s->setAcceleration(NECK_ACCEL);
 }
 
 
-// Calibrate all five axes: the three neck axes (limit + timeout only), then the
-// two eyes independently (limit, StallGuard, or timeout).
+// Calibrate all neck axes, then ask the eyes board to calibrate too.
 void calibrate() {
-  homeAxis(stepper_NL, LIMIT_PIN_NL, NULL,    NECK_SPEED_HZ, NECK_ACCEL);
-  homeAxis(stepper_NR, LIMIT_PIN_NR, NULL,    NECK_SPEED_HZ, NECK_ACCEL);
-  homeAxis(stepper_NP, LIMIT_PIN_NP, NULL,    NECK_SPEED_HZ, NECK_ACCEL);
-  homeAxis(stepper_EL, LIMIT_PIN_EL, &tmc_EL, EYE_SPEED_HZ,  EYE_ACCEL);
-  homeAxis(stepper_ER, LIMIT_PIN_ER, &tmc_ER, EYE_SPEED_HZ,  EYE_ACCEL);
+  dnSerial.println("CAL");           // tell the eyes board to home as well
+  homeAxis(stepper_NL, LIMIT_PIN_NL_MIN, LIMIT_PIN_NL_MAX);
+  homeAxis(stepper_NR, LIMIT_PIN_NR_MIN, LIMIT_PIN_NR_MAX);
+  homeAxis(stepper_NP, LIMIT_PIN_NP_MIN, LIMIT_PIN_NP_MAX);
   last_nL = last_nR = last_nP = NECK_CENTER;   // force a fresh move on next packet
-  last_eye = -1;
 }
 
 
-// Build the single status string sent upstream. Priority: unreachable eye
-// drivers, then a neck limit fault, then an eye driver/limit fault, otherwise OK.
+// Build the single status string sent upstream. Priority: dead eyes link, then a
+// neck limit fault, then an eye fault relayed from the eyes board, otherwise OK.
 void buildStatus(char *out, size_t n) {
-  if (!eyesAlive) {
+  if (!eyesSeen || (millis() - eyesLastSeen) > EYES_TIMEOUT_MS) {
     strncpy(out, "EYES OFFLINE", n);
   } else if (neckFault[0]) {
     strncpy(out, neckFault, n);
-  } else if (eyeFault[0]) {
-    strncpy(out, eyeFault, n);
+  } else if (eyesStatus[0] && strcmp(eyesStatus, "OK") != 0) {
+    strncpy(out, eyesStatus, n);
   } else {
     strncpy(out, "OK", n);
   }
@@ -458,27 +415,12 @@ void buildStatus(char *out, size_t n) {
 }
 
 
-void configTmc2209(TMC2209Stepper &drv) {
-  drv.begin();
-  drv.toff(4);
-  drv.blank_time(24);
-  drv.rms_current(EYE_CURRENT);
-  drv.microsteps(EYE_MICROSTEPS);
-  drv.en_spreadCycle(false);  // StealthChop (quiet)
-  drv.pwm_autoscale(true);
-  // StallGuard4 (used during calibration; needs tuning on real hardware)
-  drv.TCOOLTHRS(SG_TCOOLTHRS);
-  drv.SGTHRS(SG_SGTHRS);
-}
-
-
-FastAccelStepper *connectStepper(uint8_t stepPin, uint8_t dirPin, int32_t startPos,
-                                 uint32_t speed, int32_t accel) {
+FastAccelStepper *connectStepper(uint8_t stepPin, uint8_t dirPin, int32_t startPos) {
   FastAccelStepper *s = engine.stepperConnectToPin(stepPin);
   if (s) {
     s->setDirectionPin(dirPin);
-    s->setSpeedInHz(speed);
-    s->setAcceleration(accel);
+    s->setSpeedInHz(NECK_SPEED_HZ);
+    s->setAcceleration(NECK_ACCEL);
     s->setCurrentPosition(startPos);
   }
   return s;
@@ -488,35 +430,32 @@ FastAccelStepper *connectStepper(uint8_t stepPin, uint8_t dirPin, int32_t startP
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("j4_stepper booting...");
+  Serial.println("j4_stepper_neck booting...");
 
-  // --- Upstream link ---
+  // --- Links ---
   upSerial.begin(LINK_BAUD, SERIAL_8N1, UP_RX_PIN, UP_TX_PIN);   // to TTGO
+  dnSerial.begin(LINK_BAUD, SERIAL_8N1, DN_RX_PIN, DN_TX_PIN);   // to eyes board
 
-  // --- Limit switches (series NC, external pull-up -> plain INPUT) ---
-  pinMode(LIMIT_PIN_NL, INPUT);
-  pinMode(LIMIT_PIN_NR, INPUT);
-  pinMode(LIMIT_PIN_NP, INPUT);
-  pinMode(LIMIT_PIN_EL, INPUT);
-  pinMode(LIMIT_PIN_ER, INPUT);
+  // --- Limit switches, one per endpoint ---
+  // MIN ends: input-only pins, external 10k pull-up -> plain INPUT.
+  pinMode(LIMIT_PIN_NL_MIN, INPUT);
+  pinMode(LIMIT_PIN_NR_MIN, INPUT);
+  pinMode(LIMIT_PIN_NP_MIN, INPUT);
+  // MAX ends: ordinary pins, internal pull-up.
+  pinMode(LIMIT_PIN_NL_MAX, INPUT_PULLUP);
+  pinMode(LIMIT_PIN_NR_MAX, INPUT_PULLUP);
+  pinMode(LIMIT_PIN_NP_MAX, INPUT_PULLUP);
 
-  // --- Eye TMC2209 drivers over shared UART ---
-  tmcSerial.begin(115200, SERIAL_8N1, TMC2209_RX, TMC2209_TX);
-  configTmc2209(tmc_EL);
-  configTmc2209(tmc_ER);
-
-  // --- Step generators (neck DM556TEs get PUL/DIR straight from these) ---
+  // --- Step generators (DM556TE PUL/DIR are driven straight from these) ---
   engine.init();
-  stepper_NL = connectStepper(STEP_PIN_NL, DIR_PIN_NL, neckTargetInv(NECK_CENTER), NECK_SPEED_HZ, NECK_ACCEL);
-  stepper_NR = connectStepper(STEP_PIN_NR, DIR_PIN_NR, neckTarget(NECK_CENTER),    NECK_SPEED_HZ, NECK_ACCEL);
-  stepper_NP = connectStepper(STEP_PIN_NP, DIR_PIN_NP, neckTarget(NECK_CENTER),    NECK_SPEED_HZ, NECK_ACCEL);
-  stepper_EL = connectStepper(STEP_PIN_EL, DIR_PIN_EL, 0,                          EYE_SPEED_HZ,  EYE_ACCEL);
-  stepper_ER = connectStepper(STEP_PIN_ER, DIR_PIN_ER, 0,                          EYE_SPEED_HZ,  EYE_ACCEL);
+  stepper_NL = connectStepper(STEP_PIN_NL, DIR_PIN_NL, neckTargetInv(NECK_CENTER));
+  stepper_NR = connectStepper(STEP_PIN_NR, DIR_PIN_NR, neckTarget(NECK_CENTER));
+  stepper_NP = connectStepper(STEP_PIN_NP, DIR_PIN_NP, neckTarget(NECK_CENTER));
 
-  if (!stepper_NL || !stepper_NR || !stepper_NP || !stepper_EL || !stepper_ER) {
+  if (!stepper_NL || !stepper_NR || !stepper_NP) {
     Serial.println("WARNING: a stepperConnectToPin() failed -- check STEP pins");
   } else {
-    Serial.println("j4_stepper ready -- 3 neck + 2 eye motors, waiting for packets");
+    Serial.println("j4_stepper_neck ready -- 3 neck motors (DM556TE), waiting for packets");
   }
 }
 
@@ -536,28 +475,39 @@ void loop() {
     }
   }
 
+  // Downstream: status from the eyes board.
+  while (dnSerial.available()) {
+    char c = (char)dnSerial.read();
+    if (c == '\n') {
+      dnBuf[dnLen] = '\0';
+      if (dnLen > 0) parseDownstream(dnBuf);
+      dnLen = 0;
+    } else if (c != '\r' && dnLen < sizeof(dnBuf) - 1) {
+      dnBuf[dnLen++] = c;
+    } else if (c != '\r') {
+      dnLen = 0;
+    }
+  }
+
   // Run a calibration pass if one was requested (blocks while homing).
   if (calRequested) {
     calRequested = false;
     calibrate();
   }
 
-  // Safety: stop any axis whose limit trips mid-move.
+  // Safety: stop any axis moving toward a tripped endpoint.
   checkLimits();
 
   unsigned long now = millis();
 
-  // Poll the eye drivers + all limit inputs.
-  if (now - lastPoll >= POLL_INTERVAL_MS) {
-    lastPoll = now;
-    pollFaults();
-  }
-
-  // Report the merged status upstream.
+  // Report merged status + the eyes-board link state upstream.
   if (now - lastStatusTx >= STATUS_TX_MS) {
     lastStatusTx = now;
+    updateNeckFault();
     char status[24];
     buildStatus(status, sizeof(status));
     upSerial.printf("ST:%s\n", status);
+    bool eyesLinkOk = eyesSeen && (now - eyesLastSeen <= EYES_TIMEOUT_MS);
+    upSerial.printf("EY:%d\n", eyesLinkOk ? 1 : 0);
   }
 }

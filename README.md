@@ -1,28 +1,34 @@
-# j4_stepper
+# j4_stepper_neck
 
-Stepper driver board for the Johnny 4 robot -- the sole stepper node, driving all five steppers. Runs on an ESP32-DEV (WROOM) module. The three neck axes run on STEPPERONLINE DM556TE digital step/dir drivers, and the two eye-pop motors run on TMC2209 drivers over a shared UART. Step pulses run on the ESP32 RMT peripheral via FastAccelStepper, so the CPU never blocks.
+Neck stepper driver board for the Johnny 4 robot, and the middle node of the stepper daisy chain. Runs on an ESP32-DEV (WROOM) module. It drives the three neck steppers via STEPPERONLINE DM556TE digital step/dir drivers, relays the eye-pop value down to [j4_stepper_eyes](https://github.com/kevinkevinlangelange/j4_stepper_eyes), and reports neck/eye health back up to the receiver. Step pulses run on the ESP32 RMT peripheral via FastAccelStepper, so the CPU never blocks.
 
-The former [j4_stepper_eyes](https://github.com/kevinkevinlangelange/j4_stepper_eyes) board is retired: swapping the neck drivers to the DM556TE freed the six SPI pins, which is exactly enough headroom to absorb the two eye channels onto this board and delete the downstream UART link entirely.
+The two stepper boards were briefly consolidated onto one ESP32 (the repo was named j4_stepper for that stretch). They are split again as of v0_12: with the eyes on their own board there are enough pins to give **every limit switch its own input**, so the firmware knows exactly which endpoint was hit.
 
-## Where it sits
+## Daisy chain
 
 ```
   j4_controller --ESP-NOW--> j4_receiver (TTGO)
                                   |  UART1 (2-way, 250000)
                                   v
-                          j4_stepper   (3x DM556TE + 2x TMC2209)   <-- this board
+                          j4_stepper_neck   (3x DM556TE)   <-- this board
+                                  |  UART2 (2-way, 250000)
+                                  v
+                          j4_stepper_eyes   (2x TMC2209)
 ```
+
+The TTGO only has one free hardware UART, so the boards are chained rather than each wired to the TTGO. This board is the relay in the middle: it takes the full packet from the receiver, keeps the neck fields, and passes the eye field downstream; status flows back the other way.
 
 ## What this board does
 
 - Receives `nL,nR,nP,eye` from j4_receiver over UART1 (2-way)
 - Drives 3 neck steppers via STEPPERONLINE DM556TE drivers (neck left, neck right, neck pivot)
-- Drives 2 eye-pop steppers via TMC2209 drivers, each on its own step/dir channel but commanded to identical targets, so the eyes pop together yet can be trimmed/homed independently
-- Polls the TMC2209s over their shared UART for faults (overtemp, short, open-load) and link health
-- Merges everything into a single status string reported back upstream
+- Forwards the `eye` value to j4_stepper_eyes over UART2
+- Monitors six limit switches -- one per axis endpoint -- so faults name the exact switch (`NL MIN`, `NP MAX`, ...)
+- Merges its own limit status with the eyes board's status and a link-alive check, and reports a single status string back upstream
+- Reports the eyes-board link state as a separate `EY:<0/1>` line so the connection screens can show j4_stepper_eyes
 - Filters out tiny commanded changes (per-axis threshold) so the motors do not jitter at rest
 
-The DM556TE is a standalone driver: motor current and microstep resolution are set by DIP switches on the driver itself, and there is no telemetry bus back to the ESP32. Neck faults are therefore reported from the limit switches only. The eye TMC2209s do have a telemetry bus (their shared UART), so they keep full driver-fault reporting and StallGuard4 stall detection during homing.
+The DM556TE is a standalone driver: motor current and microstep resolution are set by DIP switches on the driver itself, and there is no telemetry bus back to the ESP32. Neck faults therefore come from the limit switches.
 
 ## Hardware
 
@@ -31,9 +37,8 @@ The DM556TE is a standalone driver: motor current and microstep resolution are s
 | Microcontroller | ESP32-DEV (WROOM-32) |
 | Neck drivers | 3x STEPPERONLINE DM556TE (digital step/dir, opto-isolated inputs) |
 | Neck motors | STEPPERONLINE 17HE24-2104S (2.1A) |
-| Neck motor supply | 24-50VDC to each DM556TE +Vdc |
-| Eye drivers | 2x TMC2209 (shared UART, addresses 0b00 / 0b01 via MS1/MS2) |
-| Eye motor supply | 12-24VDC to each TMC2209 VM |
+| Motor supply | 24-50VDC to each DM556TE +Vdc |
+| Limit switches | 6x normally-closed, one per axis endpoint |
 
 ## Link protocol
 
@@ -42,36 +47,41 @@ The DM556TE is a standalone driver: motor current and microstep resolution are s
 | Direction | Message | Meaning |
 |-----------|---------|---------|
 | in | `nL,nR,nP,eye\n` | neck L/R/pivot + eye-pop, all 0-3200 |
-| in | `CAL\n` | run a homing/calibration pass on all five axes |
-| out | `ST:<text>\n` | merged status, e.g. `ST:OK`, `ST:NL LIMIT`, `ST:EL OT`, `ST:EYES OFFLINE` |
+| in | `CAL\n` | run a homing/calibration pass (also forwarded to the eyes board) |
+| out | `ST:<text>\n` | merged status, e.g. `ST:OK`, `ST:NL MIN`, `ST:NP MAX`, `ST:EYES OFFLINE` |
+| out | `EY:<0/1>\n` | eyes-board link state (1 = alive) |
 
-The parser uses fixed char buffers (no Arduino `String`, so no heap fragmentation). A line that does not parse is ignored.
+**Downstream (UART2, to/from j4_stepper_eyes):**
 
-The old `EY:<0/1>` line (eyes-board link state, from when the eyes lived on their own ESP32) is gone: there is no separate link to report anymore, and an unreachable eye driver already surfaces as `ST:EYES OFFLINE`.
+| Direction | Message | Meaning |
+|-----------|---------|---------|
+| out | `<eye>\n` | the forwarded eye-pop value (0-3200) |
+| out | `CAL\n` | tell the eyes board to calibrate too |
+| in | `S:<text>\n` | the eyes board's status (`S:OK`, `S:EL MIN`, ...) |
+
+The parsers use fixed char buffers (no Arduino `String`, so no heap fragmentation). A line that does not parse is ignored.
 
 ## Status reporting
 
 Every 200 ms the board sends one status string upstream, chosen by priority:
 
-1. `EYES OFFLINE` -- one or both TMC2209s stopped responding over UART
-2. a neck limit fault -- `NL`/`NR`/`NP` + `LIMIT` (a limit switch is engaged or its wire is broken)
-3. an eye fault -- `EL`/`ER` + `OT` (overtemp shutdown), `SHORT`, `OTPW` (overtemp prewarning), `OPEN` (open load), or `LIMIT`
+1. `EYES OFFLINE` -- no status from the eyes board within 800 ms
+2. a neck limit fault naming the exact switch -- `NL`/`NR`/`NP` + `MIN` (home end) or `MAX` (far end); a switch is engaged or its wire is broken
+3. an eye fault relayed up from the eyes board (`EL`/`ER` + token)
 4. `OK`
-
-The TMC2209s and all five limit inputs are polled every 100 ms.
 
 ## Limit switches and calibration
 
-Each axis has **two normally-closed (NC) switches wired in series** to one input, with an **external 10k pull-up to 3.3V**. Both closed (in range) reads LOW; either switch opening, or a broken wire, reads HIGH and is treated as a limit hit (fail-safe). The travel direction tells which end was reached.
+Each axis has **one normally-closed (NC) switch per endpoint** -- six inputs total. Each switch shorts its input to GND while the axis is in range: LOW = in range, HIGH = that endpoint was hit **or** its wire broke (fail-safe). `MIN` is the home end that `CAL` drives toward; `MAX` is the far end.
 
-- **In normal operation**, if a limit trips while an axis is moving, that axis is stopped immediately.
-- **On a `CAL` command**, the board homes all five axes in sequence: each drives slowly toward the home end until its limit switch trips (eyes: or StallGuard4 detects a hard stop) or the per-axis timeout expires, backs off until the limit clears, and zeros the position.
+- The three MIN inputs sit on the input-only pins 34/36/39, which have no internal pull-up: each needs an **external 10k to 3.3V**.
+- The three MAX inputs sit on ordinary GPIOs 18/19/23 and use the **internal pull-up** -- no external resistor needed.
 
-The DM556TE has no stall detection, so a neck axis that starts jammed hard against the home stop cannot be sensed; it drives until the timeout and then continues. The eye axes keep StallGuard4 (read over the TMC2209 UART, no extra pins), which catches an eye already sitting against a stop the instant it tries to push further. The homing speed, back-off, direction, and the StallGuard thresholds (`SG_SGTHRS`, `SG_STALL_LEVEL`) are `#define`s at the top of `main.cpp` and **need tuning on the real mechanism**. The far-end range is then enforced in software once homed.
+**In normal operation** the safety check is direction-aware: an axis is stopped only when it is moving *toward* a tripped endpoint, so a stopped axis can always drive itself back off a limit.
 
-## DM556TE driver wiring (neck, three identical)
+**On a `CAL` command** each axis homes toward its MIN switch. An axis already sitting on the switch is detected immediately (the switch reads pressed) and just backs off and zeros -- the per-endpoint inputs make stall detection unnecessary on this board. Hitting the MAX switch during homing stops the axis (wrong direction or a wiring fault). The homing speed, back-off, and timeout are `#define`s at the top of `main.cpp` and **need tuning on the real mechanism**.
 
-The DM556TE has four terminal groups: signal inputs (PUL/DIR/ENA), VDC power, and the motor phases.
+## DM556TE driver wiring (three identical)
 
 ### Signal inputs (opto-isolated)
 
@@ -101,21 +111,8 @@ If an axis runs the wrong direction, swap that motor's A+/A- pair (or invert its
 
 Current and microstepping are set on the driver, not in firmware.
 
-- **Current (SW1-SW3) + SW4:** set to your motor from the driver's printed table. For the 2.1A neck motors use the **2.1A-peak / 1.5A-RMS** row: **SW1=on, SW2=off, SW3=off**, with **SW4=on** (full current). Move up one row if you need more holding torque and the motor stays cool.
+- **Current (SW1-SW3) + SW4:** for the 2.1A neck motors use the **2.1A-peak / 1.5A-RMS** row: **SW1=on, SW2=off, SW3=off**, with **SW4=on** (full current). Move up one row if you need more holding torque and the motor stays cool.
 - **Microstepping (SW5-SW8):** set **3200 pulse/rev** -> **SW5=on, SW6=on, SW7=off, SW8=on**. This makes one commanded unit in firmware equal one step pulse, matching the old 16-microstep scale so all the motion numbers carry over unchanged.
-
-## TMC2209 driver wiring (eyes, two on a shared UART)
-
-| TMC2209 pin | Connect to |
-|-------------|------------|
-| STEP / DIR | ESP32 18 / 19 (eye left), 23 / 5 (eye right) |
-| PDN_UART | ESP32 17 (TX, via 1k per driver) and 16 (RX), shared bus |
-| MS1 / MS2 | address straps: eye-left = 0b00, eye-right = 0b01 |
-| VIO | 3.3V |
-| VM | 12-24VDC motor supply |
-| EN | GND (always enabled) |
-
-Driver current (800 mA RMS) and microstepping (16x) for the eyes are set in firmware over the UART, unlike the DM556TEs.
 
 ## Pin assignments
 
@@ -124,17 +121,16 @@ Driver current (800 mA RMS) and microstepping (16x) for the eyes are set in firm
 | 26 / 25 | neck-left STEP / DIR -> DM556TE PUL+ / DIR+ |
 | 33 / 32 | neck-right STEP / DIR -> DM556TE PUL+ / DIR+ |
 | 27 / 14 | neck-pivot STEP / DIR -> DM556TE PUL+ / DIR+ |
-| 18 / 19 | eye-left STEP / DIR -> TMC2209 |
-| 23 / 5 | eye-right STEP / DIR -> TMC2209 |
-| 17 / 16 | TMC2209 UART TX / RX (shared bus to both eye drivers) |
 | 4 / 13 | Upstream UART1 RX / TX -- to j4_receiver: RX from TTGO GPIO 21, TX to TTGO GPIO 22 |
-| 34 | neck-left limit switches (input, external pull-up) |
-| 36 | neck-right limit switches (input, external pull-up) |
-| 39 | neck-pivot limit switches (input, external pull-up) |
-| 35 | eye-left limit switches (input, external pull-up) |
-| 22 | eye-right limit switches (input, external pull-up; onboard LED = in-range indicator) |
+| 22 / 35 | Downstream UART2 TX / RX -- to j4_stepper_eyes: TX to eyes GPIO 4, RX from eyes GPIO 13 |
+| 34 | neck-left MIN limit (input-only, external 10k pull-up) |
+| 36 | neck-right MIN limit (input-only, external 10k pull-up) |
+| 39 | neck-pivot MIN limit (input-only, external 10k pull-up) |
+| 18 | neck-left MAX limit (internal pull-up) |
+| 19 | neck-right MAX limit (internal pull-up) |
+| 23 | neck-pivot MAX limit (internal pull-up) |
 
-The board is a bare ESP32-D0WD (LOLIN32-Lite style); it does not break out GPIO 21, and it has no battery-sense pin, so the input-only 34/35/36/39 are all safe to use -- they carry four of the five limit inputs. The fifth (eye-right) rides on the ordinary GPIO 22, whose onboard LED doubles as a free in-range indicator. The step/dir lines use plain bidirectional GPIOs (strapping pins 0/2/12/15 and flash pins 6-11 avoided).
+The board is a bare ESP32-D0WD (LOLIN32-Lite style). It does **not break out GPIO 21**, so the downstream UART TX is on **GPIO 22** (which also drives the onboard LED, giving a handy downstream-activity blink). The downstream RX is on the input-only **GPIO 35**; the board has **no battery-sense pin**, so 35 is safe to use. The step/dir lines use plain bidirectional GPIOs (strapping pins 0/2/12/15 and flash pins 6-11 avoided). Pins 5/16/17 are free.
 
 Limit switches are not required for normal operation, so you can wire them whenever you add them.
 
@@ -146,31 +142,30 @@ USB-C connector at the bottom. The two header rails read top-to-bottom as shown.
 ```
           LEFT rail                                RIGHT rail
                           +--------------+
-       limit NR -- 36 |   |              |   | 3V3   3.3V (TMC2209 VIO)
-       limit NP -- 39 |   |              |   | 22    limit ER            (LED)
-          reset -- EN |   |  ESP32-D0WD  |   | 19    DIR  eye-L  -> TMC2209
-       limit NL -- 34 |   |  (LOLIN32-   |   | 23    STEP eye-R  -> TMC2209
-       limit EL -- 35 |   |   Lite style)|   | 18    STEP eye-L  -> TMC2209
-     DIR neck-R -> 32 |   |              |   | 5     DIR  eye-R  -> TMC2209
-    STEP neck-R -> 33 |   |              |   | 17    TMC2209 UART TX
-     DIR neck-L -> 25 |   |              |   | 16    TMC2209 UART RX
-    STEP neck-L -> 26 |   |              |   | 4     UART1 RX <- TTGO 21
-    STEP neck-P -> 27 |   |              |   | 0     (free / BOOT)
-     DIR neck-P -> 14 |   |              |   | 2     (free)
+   limit NR MIN -- 36 |   |              |   | 3V3   3.3V (limit pull-ups)
+   limit NP MIN -- 39 |   |              |   | 22    DN UART2 TX -> eyes 4   (LED)
+          reset -- EN |   |  ESP32-D0WD  |   | 19    limit NR MAX
+   limit NL MIN -- 34 |   |  (LOLIN32-   |   | 23    limit NP MAX
+ DN RX <-eyes13 -- 35 |   |   Lite style)|   | 18    limit NL MAX
+     DIR neck-R -- 32 |   |              |   | 5     (free)
+    STEP neck-R -- 33 |   |              |   | 17    (free)
+     DIR neck-L -- 25 |   |              |   | 16    (free)
+    STEP neck-L -- 26 |   |              |   | 4     UART1 RX <- TTGO 21
+    STEP neck-P -- 27 |   |              |   | 0     (free / BOOT)
+     DIR neck-P -- 14 |   |              |   | 2     (free)
          (free) -- 12 |   |              |   | 15    (free)
          ground -- GND|   |              |   | 13    UART1 TX -> TTGO 22
                           +---[ USB-C ]--+
 
+   GPIO 21 is NOT present on this board, which is why the downstream TX is on 22.
    Neck STEP/DIR pins feed the DM556TE PUL+/DIR+ inputs (PUL-/DIR- to GND).
-   Each limit input = two NC switches in series + a 10k pull-up to 3.3V.
-   GPIO 22's onboard LED doubles as the eye-right in-range indicator.
+   Limits: one NC switch per endpoint. MIN ends (34/36/39) need external 10k
+   pull-ups to 3.3V; MAX ends (18/19/23) use the internal pull-ups.
 ```
 
 ## Motion settings
 
 Neck values match the originals: `setSpeedInHz(3200)`, `setAcceleration(16000)`, and a per-axis change threshold of 20. With each DM556TE set to 3200 pulse/rev, one commanded unit equals one pulse, so these are the same numbers as the old 16-microstep setup. The neck-left axis is mapped inverted (`(3200 - nL) / 2`).
-
-The eyes use the same speed/accel/threshold so they ramp exactly like the neck; only the driver current differs (800 mA RMS for the small eye motors, set over the TMC2209 UART).
 
 ## Building and uploading
 
@@ -188,4 +183,4 @@ pio device monitor
 ## Related projects
 
 - **[j4_receiver](https://github.com/kevinkevinlangelange/j4_receiver)** -- the TTGO that streams `nL,nR,nP,eye` to this board and relays its status to the controller
-- **[j4_stepper_eyes](https://github.com/kevinkevinlangelange/j4_stepper_eyes)** -- retired; its two eye channels were absorbed into this board
+- **[j4_stepper_eyes](https://github.com/kevinkevinlangelange/j4_stepper_eyes)** -- the eye-pop stepper board downstream of this one
