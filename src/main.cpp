@@ -72,6 +72,14 @@
 //                   v0_10 -- Absorbed j4_stepper_eyes onto this board (the project
 //                            was briefly renamed j4_stepper).
 //                   v0_11 -- Dropped the "EY:" status line while consolidated.
+//                   v0_13 -- Doc update only (no code change): the six STEP/DIR
+//                            signals now pass through two SN74AHCT125N quad
+//                            buffers, shifting them from 3.3V to a full 5V before
+//                            the DM556TE PUL+/DIR+ opto inputs -- squarely inside
+//                            the opto's 5-24V spec instead of at its low edge.
+//                            The buffers are non-inverting, so the firmware and
+//                            the ESP32 pin map are untouched. Chip pinout and
+//                            per-buffer wiring are documented below.
 //                   v0_12 -- Split back into two boards (j4_stepper_neck +
 //                            j4_stepper_eyes) and renamed back. The pins freed by
 //                            moving the eyes off-board now give every limit switch
@@ -139,17 +147,47 @@
 //  ------------------------------------------------------------------
 //  DM556TE DRIVER WIRING (per driver -- three identical)
 //  ------------------------------------------------------------------
-//  The DM556TE inputs are optically isolated (rated 5-24V, 7-20mA). Wire them
-//  COMMON-CATHODE / active-high so the ESP32's normal 3.3V logic drives them
-//  directly and the pulse/direction polarity stays normal (no firmware inversion):
+//  The DM556TE inputs are optically isolated (rated 5-24V, 7-20mA). The six
+//  ESP32 STEP/DIR signals pass through two SN74AHCT125N quad buffers (below),
+//  which shift them from 3.3V to a full 5V. The drivers stay wired
+//  COMMON-CATHODE / active-high, so polarity stays normal (no firmware
+//  inversion):
 //
-//   ESP32 STEP pin --> PUL+        ESP32 DIR pin --> DIR+
+//   74AHCT125 Y out --> PUL+       74AHCT125 Y out --> DIR+
 //   PUL- --> ESP32 GND            DIR- --> ESP32 GND
 //   ENA+ / ENA-  left unconnected  (driver is enabled by default)
 //
-//  3.3V is at the low edge of the opto's 5V spec. It works on the bench, but if an
-//  axis drops pulses, add a 3.3V->5V level shifter on PUL/DIR, or drive the inputs
-//  common-anode from a 5V rail (which inverts polarity -- not used here).
+//  ------------------------------------------------------------------
+//  SN74AHCT125N LEVEL SHIFTERS (2 chips, U1 + U2)
+//  ------------------------------------------------------------------
+//  Quad bus buffer, non-inverting. AHCT inputs have TTL thresholds (VIH = 2.0V),
+//  so 3.3V ESP32 logic drives them directly; outputs swing to VCC = 5V, putting
+//  the DM556TE optos squarely inside their 5-24V spec. Every /OE (active-low
+//  output enable) ties to GND so the buffers are always on. Put a 100nF
+//  decoupling cap across VCC/GND of each chip, close to the pins.
+//
+//                SN74AHCT125N (DIP-14, top view, notch at the top)
+//
+//                                 +---U---+
+//               1/OE (to GND) -- 1|       |14 -- VCC (5V from the ESP32 board)
+//               1A  (input)   -- 2|       |13 -- 4/OE (to GND)
+//               1Y  (output)  -- 3|       |12 -- 4A  (input)
+//               2/OE (to GND) -- 4|       |11 -- 4Y  (output)
+//               2A  (input)   -- 5|       |10 -- 3/OE (to GND)
+//               2Y  (output)  -- 6|       | 9 -- 3A  (input)
+//               GND           -- 7|       | 8 -- 3Y  (output)
+//                                 +-------+
+//
+//  U1 (neck-left + neck-right):
+//   1A <- ESP32 26 (STEP NL)   1Y -> neck-left  DM556TE PUL+
+//   2A <- ESP32 25 (DIR  NL)   2Y -> neck-left  DM556TE DIR+
+//   3A <- ESP32 33 (STEP NR)   3Y -> neck-right DM556TE PUL+
+//   4A <- ESP32 32 (DIR  NR)   4Y -> neck-right DM556TE DIR+
+//
+//  U2 (neck-pivot; two buffers spare):
+//   1A <- ESP32 27 (STEP NP)   1Y -> neck-pivot DM556TE PUL+
+//   2A <- ESP32 14 (DIR  NP)   2Y -> neck-pivot DM556TE DIR+
+//   3A, 4A -> GND (unused inputs must not float)   3Y, 4Y -> n/c
 //
 //  DIP SWITCHES (set on each DM556TE, NOT in firmware):
 //   Current (SW1-3) + SW4 full/half: set to your motor. For the 2.1A neck motors

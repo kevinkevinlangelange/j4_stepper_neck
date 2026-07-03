@@ -36,6 +36,7 @@ The DM556TE is a standalone driver: motor current and microstep resolution are s
 |-----------|---------|
 | Microcontroller | ESP32-DEV (WROOM-32) |
 | Neck drivers | 3x STEPPERONLINE DM556TE (digital step/dir, opto-isolated inputs) |
+| Level shifters | 2x SN74AHCT125N quad buffers (3.3V STEP/DIR up to 5V) |
 | Neck motors | STEPPERONLINE 17HE24-2104S (2.1A) |
 | Motor supply | 24-50VDC to each DM556TE +Vdc |
 | Limit switches | 6x normally-closed, one per axis endpoint |
@@ -83,19 +84,61 @@ Each axis has **one normally-closed (NC) switch per endpoint** -- six inputs tot
 
 ## DM556TE driver wiring (three identical)
 
-### Signal inputs (opto-isolated)
+### Signal inputs (opto-isolated, via the 74AHCT125 buffers)
 
-The DM556TE inputs are optically isolated and rated for 5-24V logic at 7-20mA. Wire them **common-cathode / active-high** so the ESP32's normal 3.3V logic drives them directly and the pulse/direction polarity stays normal (no firmware inversion):
+The DM556TE inputs are optically isolated and rated for 5-24V logic at 7-20mA. The ESP32's 3.3V is at the low edge of that spec, so the six STEP/DIR signals pass through two **SN74AHCT125N** quad buffers (next section), which shift them to a full 5V. The drivers stay wired **common-cathode / active-high**, so the pulse/direction polarity stays normal and the firmware is unchanged:
 
 | DM556TE terminal | Connect to |
 |------------------|------------|
-| PUL+ | ESP32 STEP pin (26 / 33 / 27) |
+| PUL+ | 74AHCT125 Y output carrying that axis's STEP |
 | PUL- | ESP32 GND |
-| DIR+ | ESP32 DIR pin (25 / 32 / 14) |
+| DIR+ | 74AHCT125 Y output carrying that axis's DIR |
 | DIR- | ESP32 GND |
 | ENA+ / ENA- | leave unconnected (driver is enabled by default) |
 
-> **3.3V note:** 3.3V is at the low edge of the opto input's 5V spec. It works on the bench, but if an axis drops pulses, add a 3.3V-to-5V level shifter on the PUL/DIR lines, or drive the inputs common-anode from a 5V rail (which inverts polarity and is not used here).
+## SN74AHCT125N level shifters (U1 + U2)
+
+Quad bus buffer, non-inverting, DIP-14. The AHCT family has TTL input thresholds (a high is anything above 2.0V), so the ESP32's 3.3V logic drives the inputs directly -- while the outputs swing to VCC = 5V. Two chips cover the six STEP/DIR signals with two buffers to spare.
+
+- **VCC (pin 14)** -> the ESP32 board's 5V pin; **GND (pin 7)** -> common ground
+- **Every `/OE` pin (1, 4, 10, 13)** -> GND, so all outputs are permanently enabled
+- **100nF decoupling cap** across VCC/GND of each chip, close to the pins
+- **Unused inputs must not float** -- tie U2's 3A/4A to GND, leave 3Y/4Y unconnected
+
+### Chip pin diagram
+
+```
+        SN74AHCT125N (DIP-14, top view, notch at the top)
+
+                        +---U---+
+      1/OE (to GND) -- 1|       |14 -- VCC (5V)
+      1A  (input)   -- 2|       |13 -- 4/OE (to GND)
+      1Y  (output)  -- 3|       |12 -- 4A  (input)
+      2/OE (to GND) -- 4|       |11 -- 4Y  (output)
+      2A  (input)   -- 5|       |10 -- 3/OE (to GND)
+      2Y  (output)  -- 6|       | 9 -- 3A  (input)
+      GND           -- 7|       | 8 -- 3Y  (output)
+                        +-------+
+```
+
+### Buffer assignments
+
+**U1 (neck-left + neck-right):**
+
+| Buffer | Input (A) from | Output (Y) to |
+|--------|----------------|---------------|
+| 1 (pins 2 -> 3) | ESP32 26 (STEP NL) | neck-left DM556TE PUL+ |
+| 2 (pins 5 -> 6) | ESP32 25 (DIR NL) | neck-left DM556TE DIR+ |
+| 3 (pins 9 -> 8) | ESP32 33 (STEP NR) | neck-right DM556TE PUL+ |
+| 4 (pins 12 -> 11) | ESP32 32 (DIR NR) | neck-right DM556TE DIR+ |
+
+**U2 (neck-pivot, two buffers spare):**
+
+| Buffer | Input (A) from | Output (Y) to |
+|--------|----------------|---------------|
+| 1 (pins 2 -> 3) | ESP32 27 (STEP NP) | neck-pivot DM556TE PUL+ |
+| 2 (pins 5 -> 6) | ESP32 14 (DIR NP) | neck-pivot DM556TE DIR+ |
+| 3, 4 | tie 3A/4A to GND (spare) | leave 3Y/4Y unconnected |
 
 ### Power and motor
 
@@ -118,9 +161,9 @@ Current and microstepping are set on the driver, not in firmware.
 
 | GPIO | Function |
 |------|----------|
-| 26 / 25 | neck-left STEP / DIR -> DM556TE PUL+ / DIR+ |
-| 33 / 32 | neck-right STEP / DIR -> DM556TE PUL+ / DIR+ |
-| 27 / 14 | neck-pivot STEP / DIR -> DM556TE PUL+ / DIR+ |
+| 26 / 25 | neck-left STEP / DIR -> 74AHCT125 U1 -> DM556TE PUL+ / DIR+ |
+| 33 / 32 | neck-right STEP / DIR -> 74AHCT125 U1 -> DM556TE PUL+ / DIR+ |
+| 27 / 14 | neck-pivot STEP / DIR -> 74AHCT125 U2 -> DM556TE PUL+ / DIR+ |
 | 4 / 13 | Upstream UART1 RX / TX -- to j4_receiver: RX from TTGO GPIO 21, TX to TTGO GPIO 22 |
 | 22 / 35 | Downstream UART2 TX / RX -- to j4_stepper_eyes: TX to eyes GPIO 4, RX from eyes GPIO 13 |
 | 34 | neck-left MIN limit (input-only, external 10k pull-up) |
@@ -157,8 +200,24 @@ USB-C connector at the bottom. The two header rails read top-to-bottom as shown.
          ground -- GND|   |              |   | 13    UART1 TX -> TTGO 22
                           +---[ USB-C ]--+
 
+        SN74AHCT125N x2 (DIP-14, top view, notch at the top)
+
+                        +---U---+
+      1/OE (to GND) -- 1|       |14 -- VCC (5V)
+      1A  (input)   -- 2|       |13 -- 4/OE (to GND)
+      1Y  (output)  -- 3|       |12 -- 4A  (input)
+      2/OE (to GND) -- 4|       |11 -- 4Y  (output)
+      2A  (input)   -- 5|       |10 -- 3/OE (to GND)
+      2Y  (output)  -- 6|       | 9 -- 3A  (input)
+      GND           -- 7|       | 8 -- 3Y  (output)
+                        +-------+
+
+   U1: 1A<-26 1Y->NL PUL+ ; 2A<-25 2Y->NL DIR+ ; 3A<-33 3Y->NR PUL+ ; 4A<-32 4Y->NR DIR+
+   U2: 1A<-27 1Y->NP PUL+ ; 2A<-14 2Y->NP DIR+ ; 3A,4A->GND (spare) ; 3Y,4Y n/c
    GPIO 21 is NOT present on this board, which is why the downstream TX is on 22.
-   Neck STEP/DIR pins feed the DM556TE PUL+/DIR+ inputs (PUL-/DIR- to GND).
+   Neck STEP/DIR pins pass through the 74AHCT125 buffers (3.3V -> 5V) into the
+   DM556TE PUL+/DIR+ inputs (PUL-/DIR- to GND). 100nF across each chip's VCC/GND;
+   all /OE pins to GND.
    Limits: one NC switch per endpoint. MIN ends (34/36/39) need external 10k
    pull-ups to 3.3V; MAX ends (18/19/23) use the internal pull-ups.
 ```
