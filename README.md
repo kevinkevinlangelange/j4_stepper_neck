@@ -1,6 +1,6 @@
 # j4_stepper_neck
 
-Neck stepper driver board for the Johnny 4 robot, and the middle node of the stepper daisy chain. Runs on an ESP32-DEV (WROOM) module. It drives the three neck steppers via STEPPERONLINE DM556TE digital step/dir drivers, relays the eye-pop value down to [j4_stepper_eyes](https://github.com/kevinkevinlangelange/j4_stepper_eyes), and reports neck/eye health back up to the receiver. Step pulses run on the ESP32 RMT peripheral via FastAccelStepper, so the CPU never blocks.
+Neck stepper driver board for the Johnny 4 robot, and the middle node of the stepper daisy chain. Runs on a bare ESP32-D0WD board (LOLIN32-Lite style, see the pin diagram). It drives the three neck steppers via STEPPERONLINE DM556TE digital step/dir drivers, relays the eye-pop value down to [j4_stepper_eyes](https://github.com/kevinkevinlangelange/j4_stepper_eyes), and reports neck/eye health back up to the receiver. Step pulses run on the ESP32 RMT peripheral via FastAccelStepper, so the CPU never blocks.
 
 The two stepper boards were briefly consolidated onto one ESP32 (the repo was named j4_stepper for that stretch). They are split again as of v0_12: with the eyes on their own board there are enough pins to give **every limit switch its own input**, so the firmware knows exactly which endpoint was hit.
 
@@ -100,7 +100,7 @@ The DM556TE inputs are optically isolated and rated for 5-24V logic at 7-20mA. T
 
 Quad bus buffer, non-inverting, DIP-14. The AHCT family has TTL input thresholds (a high is anything above 2.0V), so the ESP32's 3.3V logic drives the inputs directly -- while the outputs swing to VCC = 5V. Two chips cover the six STEP/DIR signals with two buffers to spare.
 
-- **VCC (pin 14)** -> the ESP32 board's 5V pin; **GND (pin 7)** -> common ground
+- **VCC (pin 14)** -> the same 5V feed that powers the neck board (this board breaks out no 5V header pin; its 5V comes in through the USB port, see `johnny_4_docs/POWER.md`); **GND (pin 7)** -> common ground
 - **Every `/OE` pin (1, 4, 10, 13)** -> GND, so all outputs are permanently enabled
 - **100nF decoupling cap** across VCC/GND of each chip, close to the pins
 - **Unused inputs must not float** -- tie U2's 3A/4A to GND, leave 3Y/4Y unconnected
