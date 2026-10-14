@@ -34,9 +34,9 @@ The DM556TE is a standalone driver: motor current and microstep resolution are s
 
 | Component | Details |
 |-----------|---------|
-| Microcontroller | ESP32-DEV (WROOM-32) |
+| Microcontroller | Bare ESP32-D0WD board, LOLIN32-Lite style (no 5V pin, no GPIO 21) |
 | Neck drivers | 3x STEPPERONLINE DM556TE (digital step/dir, opto-isolated inputs) |
-| Level shifters | 2x SN74AHCT125N quad buffers (3.3V STEP/DIR up to 5V) |
+| Level shifters | 2x SN74ACT125N quad buffers (3.3V STEP/DIR up to 5V) |
 | Neck motors | STEPPERONLINE 17HE24-2104S (2.1A) |
 | Motor supply | 24-50VDC to each DM556TE +Vdc |
 | Limit switches | 6x normally-closed, one per axis endpoint |
@@ -84,21 +84,23 @@ Each axis has **one normally-closed (NC) switch per endpoint** -- six inputs tot
 
 ## DM556TE driver wiring (three identical)
 
-### Signal inputs (opto-isolated, via the 74AHCT125 buffers)
+### Signal inputs (opto-isolated, via the 74ACT125 buffers)
 
-The DM556TE inputs are optically isolated and rated for 5-24V logic at 7-20mA. The ESP32's 3.3V is at the low edge of that spec, so the six STEP/DIR signals pass through two **SN74AHCT125N** quad buffers (next section), which shift them to a full 5V. The drivers stay wired **common-cathode / active-high**, so the pulse/direction polarity stays normal and the firmware is unchanged:
+The DM556TE inputs are optically isolated and rated for 5-24V logic at 7-16mA (10mA typical) per input. The ESP32's 3.3V is at the low edge of that spec, so the six STEP/DIR signals pass through two **SN74ACT125N** quad buffers (next section), which shift them to a full 5V. The drivers stay wired **common-cathode / active-high**, so the pulse/direction polarity stays normal and the firmware is unchanged:
 
 | DM556TE terminal | Connect to |
 |------------------|------------|
-| PUL+ | 74AHCT125 Y output carrying that axis's STEP |
+| PUL+ | 74ACT125 Y output carrying that axis's STEP |
 | PUL- | ESP32 GND |
-| DIR+ | 74AHCT125 Y output carrying that axis's DIR |
+| DIR+ | 74ACT125 Y output carrying that axis's DIR |
 | DIR- | ESP32 GND |
 | ENA+ / ENA- | leave unconnected (driver is enabled by default) |
 
-## SN74AHCT125N level shifters (U1 + U2)
+## SN74ACT125N level shifters (U1 + U2)
 
-Quad bus buffer, non-inverting, DIP-14. The AHCT family has TTL input thresholds (a high is anything above 2.0V), so the ESP32's 3.3V logic drives the inputs directly -- while the outputs swing to VCC = 5V. Two chips cover the six STEP/DIR signals with two buffers to spare.
+Quad bus buffer, non-inverting, DIP-14. The ACT family has TTL input thresholds (a high is anything above 2.0V), so the ESP32's 3.3V logic drives the inputs directly -- while the outputs swing to VCC = 5V. Two chips cover the six STEP/DIR signals with two buffers to spare.
+
+**Use the SN74ACT125N, not the SN74AHCT125N.** The two are pin-for-pin identical, but each output here lights a DM556TE opto LED at 7-16mA, and U1 drives four of them, two of which (the DIR lines) can sit high indefinitely. TI's SN74AHCT125 datasheet recommends only 8mA per output and allows an absolute maximum of 50mA through the chip's VCC or GND pin: four optos at their 16mA worst case is 64mA, past that limit, and even at the 10mA typical each output runs above its recommended load, so its high level sags toward the opto's threshold (missed or extra steps). The SN74ACT125 is rated 24mA per output and 200mA through VCC/GND, with the same 2.0V input threshold. An AHCT125 already fitted can be swapped for an ACT125 later with no wiring change.
 
 - **VCC (pin 14)** -> the same 5V feed that powers the neck board (this board breaks out no 5V header pin; its 5V comes in through the USB port, see `johnny_4_docs/POWER.md`); **GND (pin 7)** -> common ground
 - **Every `/OE` pin (1, 4, 10, 13)** -> GND, so all outputs are permanently enabled
@@ -108,7 +110,7 @@ Quad bus buffer, non-inverting, DIP-14. The AHCT family has TTL input thresholds
 ### Chip pin diagram
 
 ```
-        SN74AHCT125N (DIP-14, top view, notch at the top)
+        SN74ACT125N (DIP-14, top view, notch at the top)
 
                         +---U---+
       1/OE (to GND) -- 1|       |14 -- VCC (5V)
@@ -161,9 +163,9 @@ Current and microstepping are set on the driver, not in firmware.
 
 | GPIO | Function |
 |------|----------|
-| 26 / 25 | neck-left STEP / DIR -> 74AHCT125 U1 -> DM556TE PUL+ / DIR+ |
-| 33 / 32 | neck-right STEP / DIR -> 74AHCT125 U1 -> DM556TE PUL+ / DIR+ |
-| 27 / 14 | neck-pivot STEP / DIR -> 74AHCT125 U2 -> DM556TE PUL+ / DIR+ |
+| 26 / 25 | neck-left STEP / DIR -> 74ACT125 U1 -> DM556TE PUL+ / DIR+ |
+| 33 / 32 | neck-right STEP / DIR -> 74ACT125 U1 -> DM556TE PUL+ / DIR+ |
+| 27 / 14 | neck-pivot STEP / DIR -> 74ACT125 U2 -> DM556TE PUL+ / DIR+ |
 | 4 / 13 | Upstream UART1 RX / TX -- to j4_receiver: RX from TTGO GPIO 21, TX to TTGO GPIO 22 |
 | 22 / 35 | Downstream UART2 TX / RX -- to j4_stepper_eyes: TX to eyes GPIO 4, RX from eyes GPIO 13 |
 | 34 | neck-left MIN limit (input-only, external 10k pull-up) |
@@ -173,7 +175,9 @@ Current and microstepping are set on the driver, not in firmware.
 | 19 | neck-right MAX limit (internal pull-up) |
 | 23 | neck-pivot MAX limit (internal pull-up) |
 
-The board is a bare ESP32-D0WD (LOLIN32-Lite style). It does **not break out GPIO 21**, so the downstream UART TX is on **GPIO 22** (which also drives the onboard LED, giving a handy downstream-activity blink). The downstream RX is on the input-only **GPIO 35**; the board has **no battery-sense pin**, so 35 is safe to use. The step/dir lines use plain bidirectional GPIOs (strapping pins 0/2/12/15 and flash pins 6-11 avoided). Pins 5/16/17 are free.
+The board is a bare ESP32-D0WD (LOLIN32-Lite style). It does **not break out GPIO 21**, so the downstream UART TX is on **GPIO 22** (which also drives the onboard LED, giving a handy downstream-activity blink). The downstream RX is on the input-only **GPIO 35**; the board has **no battery-sense pin**, so 35 is safe to use. The step/dir lines use plain bidirectional GPIOs (strapping pins 0/2/5/12/15 and flash pins 6-11 avoided). GPIO 14 (neck-pivot DIR) wiggles briefly during boot, which is harmless: a DIR change moves nothing without STEP pulses.
+
+**Spare pins:** 16 and 17 are the only fully free ones. 0, 2, 5, 12 and 15 are boot-strapping pins: anything added on them must not pull them during reset, and **GPIO 12 in particular must never be held high at power-on** (it switches the flash to 1.8V and the board will not boot).
 
 Limit switches are not required for normal operation, so you can wire them whenever you add them.
 
@@ -200,7 +204,7 @@ USB-C connector at the bottom. The two header rails read top-to-bottom as shown.
          ground -- GND|   |              |   | 13    UART1 TX -> TTGO 22
                           +---[ USB-C ]--+
 
-        SN74AHCT125N x2 (DIP-14, top view, notch at the top)
+        SN74ACT125N x2 (DIP-14, top view, notch at the top)
 
                         +---U---+
       1/OE (to GND) -- 1|       |14 -- VCC (5V)
@@ -215,7 +219,7 @@ USB-C connector at the bottom. The two header rails read top-to-bottom as shown.
    U1: 1A<-26 1Y->NL PUL+ ; 2A<-25 2Y->NL DIR+ ; 3A<-33 3Y->NR PUL+ ; 4A<-32 4Y->NR DIR+
    U2: 1A<-27 1Y->NP PUL+ ; 2A<-14 2Y->NP DIR+ ; 3A,4A->GND (spare) ; 3Y,4Y n/c
    GPIO 21 is NOT present on this board, which is why the downstream TX is on 22.
-   Neck STEP/DIR pins pass through the 74AHCT125 buffers (3.3V -> 5V) into the
+   Neck STEP/DIR pins pass through the 74ACT125 buffers (3.3V -> 5V) into the
    DM556TE PUL+/DIR+ inputs (PUL-/DIR- to GND). 100nF across each chip's VCC/GND;
    all /OE pins to GND.
    Limits: one NC switch per endpoint. MIN ends (34/36/39) need external 10k

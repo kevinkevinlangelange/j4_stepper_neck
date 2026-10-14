@@ -7,9 +7,10 @@
 //      last updated:  2026-06-19 -- CDT
 //      last updated:  2026-07-02 -- CDT
 //      last updated:  2026-07-03 -- CDT
+//      last updated:  2026-10-14 -- CDT
 //            author:  Kevin Lange
-//       description:  Neck stepper driver board for Johnny 4, on an ESP32-DEV
-//                     (WROOM) module. Drives the three neck steppers via
+//       description:  Neck stepper driver board for Johnny 4, on a bare
+//                     ESP32-D0WD board (LOLIN32-Lite style). Drives the three neck steppers via
 //                     STEPPERONLINE DM556TE digital step/dir drivers and acts as
 //                     the middle node of the stepper daisy chain:
 //
@@ -94,6 +95,12 @@
 //                            tripped end is stopped, so an axis can always drive
 //                            itself back off a limit. The downstream link (TX 22 /
 //                            RX 35), eyes status relay, and "EY:<0/1>" are back.
+//                   2026-10-14 -- Doc only (no code change): level shifters are now
+//                            SN74ACT125N, pin-identical to the AHCT125 but rated
+//                            24mA per output / 200mA per chip. Four DM556TE optos
+//                            at up to 16mA each exceed the AHCT125's 50mA chip
+//                            limit. Board named correctly (LOLIN32-Lite style,
+//                            not ESP32-DEV WROOM); spare/strapping pins listed.
 //
 //
 //
@@ -117,7 +124,7 @@
 //  ------------------------------------------------------------------
 //
 //
-//  ESP32-DEV (WROOM) Pin Connections
+//  ESP32-D0WD (LOLIN32-Lite style) Pin Connections
 //  ------------------------------------------------------------------
 //  Neck step/dir (each pair feeds one DM556TE's PUL / DIR opto inputs):
 //   26:  STEP -- neck left      25:  DIR -- neck left
@@ -147,26 +154,26 @@
 //  ------------------------------------------------------------------
 //  DM556TE DRIVER WIRING (per driver -- three identical)
 //  ------------------------------------------------------------------
-//  The DM556TE inputs are optically isolated (rated 5-24V, 7-20mA). The six
-//  ESP32 STEP/DIR signals pass through two SN74AHCT125N quad buffers (below),
+//  The DM556TE inputs are optically isolated (rated 5-24V, 7-16mA). The six
+//  ESP32 STEP/DIR signals pass through two SN74ACT125N quad buffers (below),
 //  which shift them from 3.3V to a full 5V. The drivers stay wired
 //  COMMON-CATHODE / active-high, so polarity stays normal (no firmware
 //  inversion):
 //
-//   74AHCT125 Y out --> PUL+       74AHCT125 Y out --> DIR+
+//   74ACT125 Y out --> PUL+       74ACT125 Y out --> DIR+
 //   PUL- --> ESP32 GND            DIR- --> ESP32 GND
 //   ENA+ / ENA-  left unconnected  (driver is enabled by default)
 //
 //  ------------------------------------------------------------------
-//  SN74AHCT125N LEVEL SHIFTERS (2 chips, U1 + U2)
+//  SN74ACT125N LEVEL SHIFTERS (2 chips, U1 + U2)
 //  ------------------------------------------------------------------
-//  Quad bus buffer, non-inverting. AHCT inputs have TTL thresholds (VIH = 2.0V),
+//  Quad bus buffer, non-inverting. ACT inputs have TTL thresholds (VIH = 2.0V),
 //  so 3.3V ESP32 logic drives them directly; outputs swing to VCC = 5V, putting
 //  the DM556TE optos squarely inside their 5-24V spec. Every /OE (active-low
 //  output enable) ties to GND so the buffers are always on. Put a 100nF
 //  decoupling cap across VCC/GND of each chip, close to the pins.
 //
-//                SN74AHCT125N (DIP-14, top view, notch at the top)
+//                SN74ACT125N (DIP-14, top view, notch at the top)
 //
 //                                 +---U---+
 //               1/OE (to GND) -- 1|       |14 -- VCC (5V from the ESP32 board)
@@ -202,8 +209,9 @@
 //   DM556TE +Vdc/GND -> 24-50VDC PSU  (PSU GND common with ESP32 GND)
 //  ------------------------------------------------------------------
 //
-//  NOTE: avoids strapping pins (0/2/12/15) for outputs and flash pins (6-11).
-//        Pins 5/16/17 are free.
+//  NOTE: avoids strapping pins (0/2/5/12/15) and flash pins (6-11). Spare pins:
+//        16 and 17 are fully free; 0/2/5/12/15 are strapping pins (GPIO 12 must
+//        never be held high at power-on or the board will not boot).
 //
 //******************************************************************************
 
