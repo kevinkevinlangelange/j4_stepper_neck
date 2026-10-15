@@ -36,7 +36,7 @@ The DM556TE is a standalone driver: motor current and microstep resolution are s
 |-----------|---------|
 | Microcontroller | Bare ESP32-D0WD board, LOLIN32-Lite style (no 5V pin, no GPIO 21) |
 | Neck drivers | 3x STEPPERONLINE DM556TE (digital step/dir, opto-isolated inputs) |
-| Level shifters | 2x SN74ACT125N quad buffers (3.3V STEP/DIR up to 5V) |
+| Level shifters | 3x SN74AHCT125N quad buffers, one per driver (3.3V STEP/DIR up to 5V) |
 | Neck motors | STEPPERONLINE 17HE24-2104S (2.1A) |
 | Motor supply | 24-50VDC to each DM556TE +Vdc |
 | Limit switches | 6x normally-closed, one per axis endpoint |
@@ -84,63 +84,63 @@ Each axis has **one normally-closed (NC) switch per endpoint** -- six inputs tot
 
 ## DM556TE driver wiring (three identical)
 
-### Signal inputs (opto-isolated, via the 74ACT125 buffers)
+### Signal inputs (opto-isolated, via the 74AHCT125 buffers)
 
-The DM556TE inputs are optically isolated and rated for 5-24V logic at 7-16mA (10mA typical) per input. The ESP32's 3.3V is at the low edge of that spec, so the six STEP/DIR signals pass through two **SN74ACT125N** quad buffers (next section), which shift them to a full 5V. The drivers stay wired **common-cathode / active-high**, so the pulse/direction polarity stays normal and the firmware is unchanged:
+The DM556TE inputs are optically isolated and rated for 5-24V logic at 7-16mA (10mA typical) per input. The ESP32's 3.3V is at the low edge of that spec, so the six STEP/DIR signals pass through three **SN74AHCT125N** quad buffers, one per driver (next section), which shift them to a full 5V. The drivers stay wired **common-cathode / active-high**, so the pulse/direction polarity stays normal and the firmware is unchanged:
 
 | DM556TE terminal | Connect to |
 |------------------|------------|
-| PUL+ | 74ACT125 Y output carrying that axis's STEP |
+| PUL+ | that axis's 74AHCT125, pins 3 + 6 (1Y + 2Y, tied together) |
 | PUL- | ESP32 GND |
-| DIR+ | 74ACT125 Y output carrying that axis's DIR |
+| DIR+ | that axis's 74AHCT125, pins 8 + 11 (3Y + 4Y, tied together) |
 | DIR- | ESP32 GND |
 | ENA+ / ENA- | leave unconnected (driver is enabled by default) |
 
-## SN74ACT125N level shifters (U1 + U2)
+## SN74AHCT125N level shifters (U1, U2, U3)
 
-Quad bus buffer, non-inverting, DIP-14. The ACT family has TTL input thresholds (a high is anything above 2.0V), so the ESP32's 3.3V logic drives the inputs directly -- while the outputs swing to VCC = 5V. Two chips cover the six STEP/DIR signals with two buffers to spare.
+Quad bus buffer, non-inverting, DIP-14. The AHCT family has TTL input thresholds (a high is anything above 2.0V), so the ESP32's 3.3V logic drives the inputs directly, while the outputs swing to VCC = 5V. **One chip per DM556TE**, all three wired identically.
 
-**Use the SN74ACT125N, not the SN74AHCT125N.** The two are pin-for-pin identical, but each output here lights a DM556TE opto LED at 7-16mA, and U1 drives four of them, two of which (the DIR lines) can sit high indefinitely. TI's SN74AHCT125 datasheet recommends only 8mA per output and allows an absolute maximum of 50mA through the chip's VCC or GND pin: four optos at their 16mA worst case is 64mA, past that limit, and even at the 10mA typical each output runs above its recommended load, so its high level sags toward the opto's threshold (missed or extra steps). The SN74ACT125 is rated 24mA per output and 200mA through VCC/GND, with the same 2.0V input threshold. An AHCT125 already fitted can be swapped for an ACT125 later with no wiring change.
+**Why three chips with paired buffers:** each DM556TE opto input draws 7-16mA (10mA typical), and the DIR lines can sit high indefinitely. TI's SN74AHCT125 datasheet recommends at most 8mA per output and allows an absolute maximum of 50mA through the chip's VCC or GND pin. So every signal drives **two buffers of the same chip in parallel** (inputs tied together, outputs tied together): each buffer carries 5-8mA, inside its rating, so the output stays near 5V and the opto gets its full current. With one driver per chip, each chip carries two optos, 32mA worst case, under the 50mA limit. Only parallel buffers inside one chip, never across two chips. (The SN74ACT125N, rated 24mA per output and 200mA per chip, would do the job with two chips and one buffer per signal, but it is hard to buy; the AHCT125 is easy to find.)
 
 - **VCC (pin 14)** -> the same 5V feed that powers the neck board (this board breaks out no 5V header pin; its 5V comes in through the USB port, see `johnny_4_docs/POWER.md`); **GND (pin 7)** -> common ground
 - **Every `/OE` pin (1, 4, 10, 13)** -> GND, so all outputs are permanently enabled
 - **100nF decoupling cap** across VCC/GND of each chip, close to the pins
-- **Unused inputs must not float** -- tie U2's 3A/4A to GND, leave 3Y/4Y unconnected
+- All four buffers on every chip are used, so there are no spare inputs to tie off
 
 ### Chip pin diagram
 
 ```
-        SN74ACT125N (DIP-14, top view, notch at the top)
+        SN74AHCT125N (DIP-14, top view, notch at the top)
 
                         +---U---+
       1/OE (to GND) -- 1|       |14 -- VCC (5V)
-      1A  (input)   -- 2|       |13 -- 4/OE (to GND)
-      1Y  (output)  -- 3|       |12 -- 4A  (input)
-      2/OE (to GND) -- 4|       |11 -- 4Y  (output)
-      2A  (input)   -- 5|       |10 -- 3/OE (to GND)
-      2Y  (output)  -- 6|       | 9 -- 3A  (input)
-      GND           -- 7|       | 8 -- 3Y  (output)
+      1A  (STEP in) -- 2|       |13 -- 4/OE (to GND)
+      1Y  (PUL+)    -- 3|       |12 -- 4A  (DIR in)
+      2/OE (to GND) -- 4|       |11 -- 4Y  (DIR+)
+      2A  (STEP in) -- 5|       |10 -- 3/OE (to GND)
+      2Y  (PUL+)    -- 6|       | 9 -- 3A  (DIR in)
+      GND           -- 7|       | 8 -- 3Y  (DIR+)
                         +-------+
 ```
 
 ### Buffer assignments
 
-**U1 (neck-left + neck-right):**
+Every chip is wired the same way:
 
-| Buffer | Input (A) from | Output (Y) to |
-|--------|----------------|---------------|
-| 1 (pins 2 -> 3) | ESP32 26 (STEP NL) | neck-left DM556TE PUL+ |
-| 2 (pins 5 -> 6) | ESP32 25 (DIR NL) | neck-left DM556TE DIR+ |
-| 3 (pins 9 -> 8) | ESP32 33 (STEP NR) | neck-right DM556TE PUL+ |
-| 4 (pins 12 -> 11) | ESP32 32 (DIR NR) | neck-right DM556TE DIR+ |
+| Chip pins | Connect to |
+|-----------|------------|
+| 2 + 5 (1A + 2A, tied together) | that axis's ESP32 STEP pin |
+| 3 + 6 (1Y + 2Y, tied together) | that axis's DM556TE PUL+ |
+| 9 + 12 (3A + 4A, tied together) | that axis's ESP32 DIR pin |
+| 8 + 11 (3Y + 4Y, tied together) | that axis's DM556TE DIR+ |
+| 1, 4, 10, 13 (/OE) | GND |
+| 14 (VCC) / 7 (GND) | 5V / common GND, 100nF cap across them |
 
-**U2 (neck-pivot, two buffers spare):**
-
-| Buffer | Input (A) from | Output (Y) to |
-|--------|----------------|---------------|
-| 1 (pins 2 -> 3) | ESP32 27 (STEP NP) | neck-pivot DM556TE PUL+ |
-| 2 (pins 5 -> 6) | ESP32 14 (DIR NP) | neck-pivot DM556TE DIR+ |
-| 3, 4 | tie 3A/4A to GND (spare) | leave 3Y/4Y unconnected |
+| Chip | Axis | STEP pin | DIR pin | Drives |
+|------|------|----------|---------|--------|
+| U1 | neck-left | ESP32 26 | ESP32 25 | neck-left DM556TE |
+| U2 | neck-right | ESP32 33 | ESP32 32 | neck-right DM556TE |
+| U3 | neck-pivot | ESP32 27 | ESP32 14 | neck-pivot DM556TE |
 
 ### Power and motor
 
@@ -163,9 +163,9 @@ Current and microstepping are set on the driver, not in firmware.
 
 | GPIO | Function |
 |------|----------|
-| 26 / 25 | neck-left STEP / DIR -> 74ACT125 U1 -> DM556TE PUL+ / DIR+ |
-| 33 / 32 | neck-right STEP / DIR -> 74ACT125 U1 -> DM556TE PUL+ / DIR+ |
-| 27 / 14 | neck-pivot STEP / DIR -> 74ACT125 U2 -> DM556TE PUL+ / DIR+ |
+| 26 / 25 | neck-left STEP / DIR -> 74AHCT125 U1 -> DM556TE PUL+ / DIR+ |
+| 33 / 32 | neck-right STEP / DIR -> 74AHCT125 U2 -> DM556TE PUL+ / DIR+ |
+| 27 / 14 | neck-pivot STEP / DIR -> 74AHCT125 U3 -> DM556TE PUL+ / DIR+ |
 | 4 / 13 | Upstream UART1 RX / TX -- to j4_receiver: RX from TTGO GPIO 21, TX to TTGO GPIO 22 |
 | 22 / 35 | Downstream UART2 TX / RX -- to j4_stepper_eyes: TX to eyes GPIO 4, RX from eyes GPIO 13 |
 | 34 | neck-left MIN limit (input-only, external 10k pull-up) |
@@ -204,22 +204,24 @@ USB-C connector at the bottom. The two header rails read top-to-bottom as shown.
          ground -- GND|   |              |   | 13    UART1 TX -> TTGO 22
                           +---[ USB-C ]--+
 
-        SN74ACT125N x2 (DIP-14, top view, notch at the top)
+        SN74AHCT125N x3, one per driver (DIP-14, top view, notch at the top)
 
                         +---U---+
       1/OE (to GND) -- 1|       |14 -- VCC (5V)
-      1A  (input)   -- 2|       |13 -- 4/OE (to GND)
-      1Y  (output)  -- 3|       |12 -- 4A  (input)
-      2/OE (to GND) -- 4|       |11 -- 4Y  (output)
-      2A  (input)   -- 5|       |10 -- 3/OE (to GND)
-      2Y  (output)  -- 6|       | 9 -- 3A  (input)
-      GND           -- 7|       | 8 -- 3Y  (output)
+      1A  (STEP in) -- 2|       |13 -- 4/OE (to GND)
+      1Y  (PUL+)    -- 3|       |12 -- 4A  (DIR in)
+      2/OE (to GND) -- 4|       |11 -- 4Y  (DIR+)
+      2A  (STEP in) -- 5|       |10 -- 3/OE (to GND)
+      2Y  (PUL+)    -- 6|       | 9 -- 3A  (DIR in)
+      GND           -- 7|       | 8 -- 3Y  (DIR+)
                         +-------+
 
-   U1: 1A<-26 1Y->NL PUL+ ; 2A<-25 2Y->NL DIR+ ; 3A<-33 3Y->NR PUL+ ; 4A<-32 4Y->NR DIR+
-   U2: 1A<-27 1Y->NP PUL+ ; 2A<-14 2Y->NP DIR+ ; 3A,4A->GND (spare) ; 3Y,4Y n/c
+   Each chip: pins 2+5 tied <- STEP, pins 3+6 tied -> PUL+ ;
+              pins 9+12 tied <- DIR, pins 8+11 tied -> DIR+
+   U1 neck-left:  STEP 26, DIR 25    U2 neck-right: STEP 33, DIR 32
+   U3 neck-pivot: STEP 27, DIR 14
    GPIO 21 is NOT present on this board, which is why the downstream TX is on 22.
-   Neck STEP/DIR pins pass through the 74ACT125 buffers (3.3V -> 5V) into the
+   Neck STEP/DIR pins pass through the 74AHCT125 buffers (3.3V -> 5V) into the
    DM556TE PUL+/DIR+ inputs (PUL-/DIR- to GND). 100nF across each chip's VCC/GND;
    all /OE pins to GND.
    Limits: one NC switch per endpoint. MIN ends (34/36/39) need external 10k

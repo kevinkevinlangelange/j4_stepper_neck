@@ -8,6 +8,7 @@
 //      last updated:  2026-07-02 -- CDT
 //      last updated:  2026-07-03 -- CDT
 //      last updated:  2026-10-14 -- CDT
+//      last updated:  2026-10-15 -- CDT
 //            author:  Kevin Lange
 //       description:  Neck stepper driver board for Johnny 4, on a bare
 //                     ESP32-D0WD board (LOLIN32-Lite style). Drives the three neck steppers via
@@ -101,6 +102,12 @@
 //                            at up to 16mA each exceed the AHCT125's 50mA chip
 //                            limit. Board named correctly (LOLIN32-Lite style,
 //                            not ESP32-DEV WROOM); spare/strapping pins listed.
+//                   2026-10-15 -- Doc only (no code change): back to SN74AHCT125N
+//                            (the ACT125 is hard to buy), now THREE chips, one
+//                            per DM556TE, each signal on two paralleled buffers
+//                            of the same chip. Each buffer carries 5-8mA, inside
+//                            the AHCT125's 8mA/output rating; each chip 32mA
+//                            worst case, under its 50mA limit.
 //
 //
 //
@@ -155,46 +162,49 @@
 //  DM556TE DRIVER WIRING (per driver -- three identical)
 //  ------------------------------------------------------------------
 //  The DM556TE inputs are optically isolated (rated 5-24V, 7-16mA). The six
-//  ESP32 STEP/DIR signals pass through two SN74ACT125N quad buffers (below),
+//  ESP32 STEP/DIR signals pass through three SN74AHCT125N quad buffers (below),
 //  which shift them from 3.3V to a full 5V. The drivers stay wired
 //  COMMON-CATHODE / active-high, so polarity stays normal (no firmware
 //  inversion):
 //
-//   74ACT125 Y out --> PUL+       74ACT125 Y out --> DIR+
+//   74AHCT125 1Y+2Y --> PUL+      74AHCT125 3Y+4Y --> DIR+
 //   PUL- --> ESP32 GND            DIR- --> ESP32 GND
 //   ENA+ / ENA-  left unconnected  (driver is enabled by default)
 //
 //  ------------------------------------------------------------------
-//  SN74ACT125N LEVEL SHIFTERS (2 chips, U1 + U2)
+//  SN74AHCT125N LEVEL SHIFTERS (3 chips, U1 + U2 + U3, one per driver)
 //  ------------------------------------------------------------------
-//  Quad bus buffer, non-inverting. ACT inputs have TTL thresholds (VIH = 2.0V),
+//  Quad bus buffer, non-inverting. AHCT inputs have TTL thresholds (VIH = 2.0V),
 //  so 3.3V ESP32 logic drives them directly; outputs swing to VCC = 5V, putting
 //  the DM556TE optos squarely inside their 5-24V spec. Every /OE (active-low
 //  output enable) ties to GND so the buffers are always on. Put a 100nF
 //  decoupling cap across VCC/GND of each chip, close to the pins.
 //
-//                SN74ACT125N (DIP-14, top view, notch at the top)
+//  Each opto input draws 7-16mA, more than one AHCT125 buffer is rated for
+//  (8mA), so every signal drives TWO buffers of the same chip in parallel:
+//  inputs tied together, outputs tied together. Each buffer then carries
+//  5-8mA, and each chip (two optos) at most 32mA of its 50mA limit. Only
+//  parallel buffers inside ONE chip, never across chips.
+//
+//                SN74AHCT125N (DIP-14, top view, notch at the top)
 //
 //                                 +---U---+
 //               1/OE (to GND) -- 1|       |14 -- VCC (5V from the ESP32 board)
-//               1A  (input)   -- 2|       |13 -- 4/OE (to GND)
-//               1Y  (output)  -- 3|       |12 -- 4A  (input)
-//               2/OE (to GND) -- 4|       |11 -- 4Y  (output)
-//               2A  (input)   -- 5|       |10 -- 3/OE (to GND)
-//               2Y  (output)  -- 6|       | 9 -- 3A  (input)
-//               GND           -- 7|       | 8 -- 3Y  (output)
+//               1A  (STEP in) -- 2|       |13 -- 4/OE (to GND)
+//               1Y  (PUL+)    -- 3|       |12 -- 4A  (DIR in)
+//               2/OE (to GND) -- 4|       |11 -- 4Y  (DIR+)
+//               2A  (STEP in) -- 5|       |10 -- 3/OE (to GND)
+//               2Y  (PUL+)    -- 6|       | 9 -- 3A  (DIR in)
+//               GND           -- 7|       | 8 -- 3Y  (DIR+)
 //                                 +-------+
 //
-//  U1 (neck-left + neck-right):
-//   1A <- ESP32 26 (STEP NL)   1Y -> neck-left  DM556TE PUL+
-//   2A <- ESP32 25 (DIR  NL)   2Y -> neck-left  DM556TE DIR+
-//   3A <- ESP32 33 (STEP NR)   3Y -> neck-right DM556TE PUL+
-//   4A <- ESP32 32 (DIR  NR)   4Y -> neck-right DM556TE DIR+
+//  Same wiring on all three chips:
+//   pins 2 + 5  (1A+2A) <- that axis's STEP pin    pins 3 + 6  (1Y+2Y) -> its PUL+
+//   pins 9 + 12 (3A+4A) <- that axis's DIR pin     pins 8 + 11 (3Y+4Y) -> its DIR+
 //
-//  U2 (neck-pivot; two buffers spare):
-//   1A <- ESP32 27 (STEP NP)   1Y -> neck-pivot DM556TE PUL+
-//   2A <- ESP32 14 (DIR  NP)   2Y -> neck-pivot DM556TE DIR+
-//   3A, 4A -> GND (unused inputs must not float)   3Y, 4Y -> n/c
+//   U1 neck-left:   STEP 26, DIR 25 -> neck-left  DM556TE
+//   U2 neck-right:  STEP 33, DIR 32 -> neck-right DM556TE
+//   U3 neck-pivot:  STEP 27, DIR 14 -> neck-pivot DM556TE
 //
 //  DIP SWITCHES (set on each DM556TE, NOT in firmware):
 //   Current (SW1-3) + SW4 full/half: set to your motor. For the 2.1A neck motors
